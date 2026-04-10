@@ -42,7 +42,7 @@ class BotBase(ABC):
         self.config        = config
         self.bot_id        = config["id"]
         self.bot_name      = config["name"]
-        self.assets        = config["assets"]
+        self.assets        = config.get("assets", [])   # Bot7 has no fixed assets
         self.timeframe     = config.get("timeframe_signal", "1H")
         self._running      = False
         self._paused       = False

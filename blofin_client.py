@@ -41,6 +41,7 @@ def _auth_headers(method: str, path: str, body: str = "") -> dict:
         "ACCESS-KEY":        BLOFIN_API_KEY,
         "ACCESS-SIGN":       _sign(BLOFIN_API_SECRET, ts, method, path, body),
         "ACCESS-TIMESTAMP":  ts,
+        "ACCESS-NONCE":      ts,          # BloFin requires this — same value as timestamp
         "ACCESS-PASSPHRASE": BLOFIN_API_PASSPHRASE,
         "Content-Type":      "application/json",
     }

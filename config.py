@@ -206,6 +206,7 @@ BOT6 = {
 BOT7 = {
     "id":              "bot7_momentum",
     "name":            "Multi-Asset Momentum",
+    "assets":          [],             # empty — universe built dynamically at runtime
     "universe_size":   10,            # top 10 assets by 30-day volume
     "momentum_period": 20,            # 20-day momentum score
     "atr_period":      20,
