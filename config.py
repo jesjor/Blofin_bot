@@ -228,7 +228,7 @@ BOT7 = {
 # ============================================================
 SYSTEM = {
     "heartbeat_interval_seconds":  30,
-    "watchdog_timeout_seconds":    90,     # restart bot if no heartbeat for 90s
+    "watchdog_timeout_seconds":    120,    # 4× heartbeat interval — plenty of margin
     "api_retry_attempts":          9,
     "api_backoff_seconds":         [1, 2, 4, 8, 16, 32, 60, 120, 300],
     "ws_reconnect_delay_seconds":  5,

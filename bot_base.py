@@ -62,7 +62,19 @@ class BotBase(ABC):
             minute=0, second=0, microsecond=0
         ) + timedelta(hours=1)
         await upsert_bot_state(self.bot_id, "RUNNING")
+        # Run heartbeat as a separate task so slow strategy ticks don't cause
+        # watchdog false-positives
+        asyncio.create_task(self._heartbeat_loop(), name=f"hb_{self.bot_id}")
         await self._run_loop()
+
+    async def _heartbeat_loop(self) -> None:
+        """Fires every 30s independently of the strategy loop."""
+        while self._running:
+            try:
+                await db_heartbeat(self.bot_id)
+            except Exception:
+                pass
+            await asyncio.sleep(SYSTEM["heartbeat_interval_seconds"])
 
     async def stop(self) -> None:
         log.info("[%s] Stopping...", self.bot_id)
@@ -85,9 +97,6 @@ class BotBase(ABC):
         alert = get_alert_manager()
         while self._running:
             try:
-                # Heartbeat
-                await db_heartbeat(self.bot_id)
-
                 # Reset hourly trade counts
                 now = datetime.now(timezone.utc)
                 if now >= self._hour_reset:

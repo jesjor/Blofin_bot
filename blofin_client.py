@@ -147,8 +147,10 @@ class BloFinClient:
 
     async def get_orderbook(self, inst_id: str, depth: int = 20) -> dict:
         """Order book with bids and asks."""
-        return await self._request("GET", "/api/v1/market/books",
+        data = await self._request("GET", "/api/v1/market/books",
                                     params={"instId": inst_id, "sz": str(depth)})
+        # BloFin returns data as a list — take first element
+        return data[0] if isinstance(data, list) and data else (data or {})
 
     async def get_candles(self, inst_id: str, bar: str = "1H",
                            limit: int = 100) -> List[list]:
@@ -164,8 +166,12 @@ class BloFinClient:
 
     async def get_funding_rate(self, inst_id: str) -> dict:
         """Current and next funding rate for a perpetual."""
-        return await self._request("GET", "/api/v1/public/funding-rate",
+        data = await self._request("GET", "/api/v1/public/funding-rate",
                                     params={"instId": inst_id})
+        # Normalize list response
+        if isinstance(data, list):
+            return data[0] if data else {}
+        return data or {}
 
     async def get_mark_price(self, inst_id: str) -> float:
         data = await self._request("GET", "/api/v1/public/mark-price",
@@ -181,9 +187,9 @@ class BloFinClient:
     async def get_balance(self) -> dict:
         """Account balance. Returns {currency: {equity, available, ...}}."""
         data = await self._request("GET", "/api/v1/account/balance", signed=True)
-        if isinstance(data, list) and data:
-            return data[0]
-        return data
+        if isinstance(data, list):
+            return data[0] if data else {}
+        return data or {}
 
     async def get_usdt_balance(self) -> float:
         """Convenience: return available USDT equity."""
