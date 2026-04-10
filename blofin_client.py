@@ -120,6 +120,10 @@ class BloFinClient:
                 if resp.status >= 500:
                     raise aiohttp.ClientError(f"server_error_{resp.status}")
 
+                # Some BloFin endpoints return a raw list with no code/data wrapper
+                if isinstance(raw, list):
+                    return raw
+
                 code = raw.get("code", "0")
                 if str(code) not in ("0", "200"):
                     raise self.BloFinAPIError(int(code), raw.get("msg", "unknown"), raw)

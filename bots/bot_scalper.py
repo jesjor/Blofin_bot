@@ -136,7 +136,7 @@ class ScalperBot(BotBase):
                     self._set_cooldown(inst_id, self.config["cooldown_seconds"])
 
         except Exception as e:
-            log.error("[%s] error %s: %s", self.bot_id, inst_id, e)
+            log.error("[%s] error %s: %s", self.bot_id, inst_id, e, exc_info=True)
 
     async def _manage_scalp(self, pos: dict, current_price: float) -> None:
         position_id = pos["position_id"]

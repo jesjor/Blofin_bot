@@ -100,7 +100,7 @@ class MarketMakerBot(BotBase):
                        self.bot_id, inst_id, our_bid, our_ask, inventory)
 
         except Exception as e:
-            log.error("[%s] MM error %s: %s", self.bot_id, inst_id, e)
+            log.error("[%s] MM error %s: %s", self.bot_id, inst_id, e, exc_info=True)
 
     async def _cancel_all(self, inst_id: str) -> None:
         client = await get_client()
