@@ -322,31 +322,7 @@ class PositionManager:
 
     async def check_sl_tp_paper(self, position_id: str,
                                   current_price: float) -> Optional[str]:
-        """
-        In paper mode, manually check if price has hit TP or SL.
-        Returns "TP", "SL", or None.
-        """
-        if not IS_PAPER:
-            return None
-        positions = await get_open_positions()
-        pos = next((p for p in positions if p["position_id"] == position_id), None)
-        if not pos:
-            return None
-
-        side = pos["side"]
-        tp = float(pos["tp_price"]) if pos.get("tp_price") else None
-        sl = float(pos["sl_price"]) if pos.get("sl_price") else None
-
-        if side == "LONG":
-            if tp and current_price >= tp:
-                return "TP"
-            if sl and current_price <= sl:
-                return "SL"
-        else:
-            if tp and current_price <= tp:
-                return "TP"
-            if sl and current_price >= sl:
-                return "SL"
+        """No longer used - BloFin demo exchange handles SL/TP natively."""
         return None
 
     # ── Cancel unfilled order ─────────────────────────────────────────────────
