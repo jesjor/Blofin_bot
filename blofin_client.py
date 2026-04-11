@@ -187,8 +187,7 @@ class BloFinClient:
     async def get_funding_rate(self, inst_id: str) -> dict:
         """Current and next funding rate for a perpetual."""
         data = await self._request("GET", "/api/v1/public/funding-rate",
-                                    params={"instId": inst_id})
-        # Normalize list response
+                                    params={"instId": inst_id}, signed=True)
         if isinstance(data, list):
             return data[0] if data else {}
         return data or {}
@@ -205,16 +204,37 @@ class BloFinClient:
     # ── Account ───────────────────────────────────────────────────────────────
 
     async def get_balance(self) -> dict:
-        """Account balance."""
+        """Futures account balance — used for all trading operations."""
+        # Trading section endpoint, not the spot account balance
         data = await self._request("GET", "/api/v1/account/balance", signed=True)
         if isinstance(data, list):
             return data[0] if data else {}
         return data or {}
 
+    async def get_futures_balance(self) -> dict:
+        """Alternative futures balance endpoint."""
+        data = await self._request("GET", "/api/v1/account/futures-balance", signed=True)
+        if isinstance(data, list):
+            return data[0] if data else {}
+        return data or {}
+
     async def get_usdt_balance(self) -> float:
-        """Return available USDT equity from demo or live account."""
+        """Return available USDT equity for futures trading."""
+        # Try futures-specific balance first, fall back to general balance
+        try:
+            bal = await self.get_futures_balance()
+            if bal:
+                details = bal.get("details", [])
+                for item in details:
+                    if item.get("currency") == "USDT":
+                        return float(item.get("equity") or item.get("available") or 0)
+                if bal.get("totalEquity"):
+                    return float(bal["totalEquity"])
+        except Exception:
+            pass
+
+        # Fall back to general account balance
         bal = await self.get_balance()
-        # BloFin uses: details[].currency, details[].equity, totalEquity
         details = bal.get("details", [])
         for item in details:
             if item.get("currency") == "USDT":
@@ -253,21 +273,22 @@ class BloFinClient:
 
         body: Dict[str, Any] = {
             "instId":     inst_id,
-            "marginMode": "cross",       # BloFin uses marginMode, not tdMode
+            "marginMode": "cross",
             "side":       side.lower(),
-            "ordType":    order_type.lower(),
-            "sz":         str(round(size, 4)),
-            "clOrdId":    client_order_id,
-            "reduceOnly": str(reduce_only).lower(),
+            "orderType":  order_type.lower(),
+            "size":       str(round(size, 4)),      # BloFin: size not sz
+            "clientOrderId": client_order_id,       # BloFin: clientOrderId not clOrdId
         }
         if price and order_type.lower() == "limit":
-            body["px"] = str(round(price, 2))
+            body["price"] = str(round(price, 2))
+        if reduce_only:
+            body["reduceOnly"] = "true"
         if tp_price:
-            body["tpTriggerPx"] = str(round(tp_price, 2))
-            body["tpOrdPx"]     = "-1"
+            body["tpTriggerPrice"] = str(round(tp_price, 2))   # BloFin field name
+            body["tpOrderPrice"]   = "-1"
         if sl_price:
-            body["slTriggerPx"] = str(round(sl_price, 2))
-            body["slOrdPx"]     = "-1"
+            body["slTriggerPrice"] = str(round(sl_price, 2))   # BloFin field name
+            body["slOrderPrice"]   = "-1"
 
         # Both PAPER and LIVE send real orders — PAPER uses demo exchange URL
         result = await self._request("POST", "/api/v1/trade/order",
@@ -282,9 +303,9 @@ class BloFinClient:
                             client_order_id: str = None) -> dict:
         body: Dict[str, Any] = {"instId": inst_id}
         if order_id:
-            body["ordId"] = order_id
+            body["orderId"] = order_id
         elif client_order_id:
-            body["clOrdId"] = client_order_id
+            body["clientOrderId"] = client_order_id
         else:
             raise ValueError("Must provide order_id or client_order_id")
 
@@ -297,7 +318,7 @@ class BloFinClient:
         if not pending:
             return
         tasks = [
-            self.cancel_order(inst_id, order_id=o.get("ordId"))
+            self.cancel_order(inst_id, order_id=o.get("orderId") or o.get("ordId"))
             for o in pending
         ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -317,9 +338,9 @@ class BloFinClient:
                          client_order_id: str = None) -> Optional[dict]:
         params = {"instId": inst_id}
         if order_id:
-            params["ordId"] = order_id
+            params["orderId"] = order_id
         elif client_order_id:
-            params["clOrdId"] = client_order_id
+            params["clientOrderId"] = client_order_id
         data = await self._request("GET", "/api/v1/trade/order",
                                     params=params, signed=True)
         return data if isinstance(data, dict) else (data[0] if data else None)
@@ -346,11 +367,11 @@ class BloFinClient:
             "posSide":    pos_side,
         }
         if tp_price:
-            body["tpTriggerPx"] = str(round(tp_price, 2))
-            body["tpOrdPx"]     = "-1"
+            body["tpTriggerPrice"] = str(round(tp_price, 2))
+            body["tpOrderPrice"]   = "-1"
         if sl_price:
-            body["slTriggerPx"] = str(round(sl_price, 2))
-            body["slOrdPx"]     = "-1"
+            body["slTriggerPrice"] = str(round(sl_price, 2))
+            body["slOrderPrice"]   = "-1"
 
         return await self._request("POST", "/api/v1/trade/order-algo",
                                     body=body, signed=True)
