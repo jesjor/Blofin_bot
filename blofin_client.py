@@ -205,20 +205,36 @@ class BloFinClient:
     # ── Account ───────────────────────────────────────────────────────────────
 
     async def get_balance(self) -> dict:
-        """Account balance. Returns {currency: {equity, available, ...}}."""
+        """Account balance."""
         data = await self._request("GET", "/api/v1/account/balance", signed=True)
+        log.info("RAW BALANCE RESPONSE: %s", str(data)[:500])   # temp debug
         if isinstance(data, list):
             return data[0] if data else {}
         return data or {}
 
     async def get_usdt_balance(self) -> float:
-        """Convenience: return available USDT equity."""
+        """Return available USDT equity from demo or live account."""
         bal = await self.get_balance()
+        log.info("PARSED BALANCE DICT: %s", str(bal)[:300])   # temp debug
+        # Structure 1: {"details": [{"ccy": "USDT", "eq": "49840"}]}
         details = bal.get("details", [])
         for item in details:
             if item.get("ccy") == "USDT":
-                return float(item.get("eq", 0))
-        return float(bal.get("totalEq", 0))
+                val = float(item.get("eq", 0) or item.get("availEq", 0) or 0)
+                log.info("USDT BALANCE from details: %.2f", val)
+                return val
+        # Structure 2: {"totalEq": "49840"}
+        if bal.get("totalEq"):
+            val = float(bal["totalEq"])
+            log.info("USDT BALANCE from totalEq: %.2f", val)
+            return val
+        # Structure 3: flat {"ccy": "USDT", "eq": "49840"}
+        if bal.get("ccy") == "USDT":
+            val = float(bal.get("eq", 0) or 0)
+            log.info("USDT BALANCE from flat: %.2f", val)
+            return val
+        log.warning("COULD NOT PARSE BALANCE. Full response: %s", str(bal)[:500])
+        return 0.0
 
     async def get_positions(self, inst_id: str = None) -> List[dict]:
         """All open positions on the account."""
@@ -247,7 +263,7 @@ class BloFinClient:
 
         body: Dict[str, Any] = {
             "instId":  inst_id,
-            "tdMode":  "cross",        # cross-margin for perpetuals
+            "tdMode":  "cross",
             "side":    side.lower(),
             "ordType": order_type.lower(),
             "sz":      str(round(size, 4)),
@@ -258,25 +274,17 @@ class BloFinClient:
             body["px"] = str(round(price, 2))
         if tp_price:
             body["tpTriggerPx"] = str(round(tp_price, 2))
-            body["tpOrdPx"]     = "-1"     # market TP
+            body["tpOrdPx"]     = "-1"
         if sl_price:
             body["slTriggerPx"] = str(round(sl_price, 2))
-            body["slOrdPx"]     = "-1"     # market SL
+            body["slOrdPx"]     = "-1"
 
-        if IS_PAPER:
-            log.info("[PAPER] ORDER: %s %s %s @ %.4f sz=%.4f",
-                      inst_id, side, order_type, price or 0, size)
-            return {
-                "ordId":   f"PAPER_{client_order_id}",
-                "clOrdId": client_order_id,
-                "sCode":   "0",
-                "sMsg":    "paper_mode",
-            }
-
+        # Both PAPER and LIVE send real orders — PAPER uses demo exchange URL
         result = await self._request("POST", "/api/v1/trade/order",
                                       body=body, signed=True)
-        log.info("ORDER PLACED: %s %s %s @ %s sz=%s -> ordId=%s",
-                  inst_id, side, order_type, price, size,
+        mode = "DEMO" if IS_PAPER else "LIVE"
+        log.info("[%s] ORDER PLACED: %s %s %s @ %s sz=%s -> %s",
+                  mode, inst_id, side, order_type, price, size,
                   result.get("ordId") if isinstance(result, dict) else result)
         return result
 
@@ -289,10 +297,6 @@ class BloFinClient:
             body["clOrdId"] = client_order_id
         else:
             raise ValueError("Must provide order_id or client_order_id")
-
-        if IS_PAPER:
-            log.info("[PAPER] CANCEL: %s", order_id or client_order_id)
-            return {"sCode": "0"}
 
         return await self._request("POST", "/api/v1/trade/cancel-order",
                                     body=body, signed=True)
@@ -357,11 +361,6 @@ class BloFinClient:
         if sl_price:
             body["slTriggerPx"] = str(round(sl_price, 2))
             body["slOrdPx"]     = "-1"
-
-        if IS_PAPER:
-            log.info("[PAPER] SET TP/SL: %s tp=%.4f sl=%.4f",
-                      inst_id, tp_price or 0, sl_price or 0)
-            return {}
 
         return await self._request("POST", "/api/v1/trade/order-algo",
                                     body=body, signed=True)
