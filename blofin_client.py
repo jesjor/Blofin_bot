@@ -255,6 +255,37 @@ class BloFinClient:
                                     params=params, signed=True)
         return data if isinstance(data, list) else []
 
+    async def set_leverage(self, inst_id: str, leverage: int,
+                            margin_mode: str = "cross") -> dict:
+        """Set leverage for an instrument before trading."""
+        body = {
+            "instId":     inst_id,
+            "leverage":   str(leverage),
+            "marginMode": margin_mode,
+        }
+        try:
+            result = await self._request("POST", "/api/v1/account/set-leverage",
+                                          body=body, signed=True)
+            log.info("Leverage set: %s %dx %s", inst_id, leverage, margin_mode)
+            return result
+        except Exception as e:
+            log.warning("set_leverage failed for %s: %s", inst_id, e)
+            return {}
+
+    async def get_instruments(self, inst_type: str = "SWAP") -> List[dict]:
+        """Get instrument specs including minimum order size (minSz) and contract value."""
+        data = await self._request("GET", "/api/v1/public/instruments",
+                                    params={"instType": inst_type})
+        return data if isinstance(data, list) else []
+
+    async def get_min_size(self, inst_id: str) -> float:
+        """Return minimum order size for an instrument. Defaults to 1."""
+        instruments = await self.get_instruments()
+        for inst in instruments:
+            if inst.get("instId") == inst_id:
+                return float(inst.get("minSize") or inst.get("minSz") or 1)
+        return 1.0
+
     # ── Order management ──────────────────────────────────────────────────────
 
     async def place_order(self, inst_id: str, side: str, order_type: str,
@@ -276,8 +307,9 @@ class BloFinClient:
             "marginMode": "cross",
             "side":       side.lower(),
             "orderType":  order_type.lower(),
-            "size":       str(round(size, 4)),      # BloFin: size not sz
-            "clientOrderId": client_order_id,       # BloFin: clientOrderId not clOrdId
+            # Send as integer string if whole number, e.g. "1" not "1.0"
+            "size":       str(int(size)) if size == int(size) else str(round(size, 4)),
+            "clientOrderId": client_order_id,
         }
         if price and order_type.lower() == "limit":
             body["price"] = str(round(price, 2))
@@ -291,7 +323,6 @@ class BloFinClient:
             body["slOrderPrice"]   = "-1"
 
         # Both PAPER and LIVE send real orders — PAPER uses demo exchange URL
-        log.info("PLACING ORDER body: %s", body)
         result = await self._request("POST", "/api/v1/trade/order",
                                       body=body, signed=True)
         mode = "DEMO" if IS_PAPER else "LIVE"

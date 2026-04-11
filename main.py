@@ -105,6 +105,17 @@ async def main() -> None:
     from dashboard import start_dashboard
     await start_dashboard()
 
+    # ── 8.5 Set leverage on all trading pairs ────────────────────────────────
+    # BloFin requires explicit leverage setting. Default = 5x cross margin.
+    # Conservative for demo — adjust in config once validated.
+    LEVERAGE = 5
+    log.info("Setting leverage %dx on all assets...", LEVERAGE)
+    for asset in PRIMARY_ASSETS:
+        try:
+            await client.set_leverage(asset, LEVERAGE, "cross")
+        except Exception as e:
+            log.warning("Could not set leverage for %s: %s", asset, e)
+
     # ── 9. Instantiate bots ───────────────────────────────────────────────────
     from bots import (
         FundingArbBot, TrendFollowerBot, BreakoutBot,
