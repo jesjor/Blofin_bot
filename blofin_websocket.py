@@ -1,250 +1,440 @@
 """
-blofin_websocket.py — Real-time WebSocket price feed from BloFin.
-
-Subscribes to:
-  - Ticker channel: best bid/ask, last price (used by scalper + MM)
-  - Order updates: fill notifications for position tracking
-  - Funding rate updates: used by Bot 6
-
-Handles reconnection with exponential backoff automatically.
-All messages are dispatched to registered callbacks.
+blofin_client.py — Authenticated REST API client for BloFin.
+Every request is signed per BloFin spec. Retry logic is built in.
+Paper mode stubs order placement but reads live market data.
 """
 
 import asyncio
 import hashlib
 import hmac
 import base64
-import json
 import logging
 import time
-from typing import Dict, Callable, Awaitable, List, Optional, Set
+import uuid
+import json
+from typing import Optional, Dict, Any, List
+from datetime import datetime, timezone
 
-import websockets
-from websockets.exceptions import ConnectionClosed
+import aiohttp
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 from config import (
     BLOFIN_API_KEY, BLOFIN_API_SECRET, BLOFIN_API_PASSPHRASE,
-    BLOFIN_WS_PUBLIC, BLOFIN_WS_PRIVATE, SYSTEM,
+    BLOFIN_REST_URL, IS_PAPER, SYSTEM,
 )
 
-log = logging.getLogger("websocket")
-
-# Callback type: (channel, inst_id, data) -> None
-WSCallback = Callable[[str, str, dict], Awaitable[None]]
+log = logging.getLogger("blofin_client")
 
 
-def _ws_sign(secret: str) -> tuple:
-    ts = str(int(time.time()))
-    msg = ts + "GET" + "/users/self/verify"
-    sig = base64.b64encode(
-        hmac.new(secret.encode(), msg.encode(), hashlib.sha256).digest()
-    ).decode()
-    return ts, sig
+# ── Auth ──────────────────────────────────────────────────────────────────────
 
+import uuid as _uuid
 
-class BloFinWebSocket:
+def _sign(secret: str, path: str, method: str, timestamp: str,
+          nonce: str, body: str = "") -> str:
     """
-    Manages public + private WebSocket connections.
-    Auto-reconnects, auto-resubscribes after reconnect.
+    BloFin signature spec:
+      prehash = path + method + timestamp + nonce + body
+      hex_sig  = HMAC-SHA256(secret, prehash).hexdigest()
+      sign     = base64(hex_sig.encode())
     """
+    prehash    = f"{path}{method}{timestamp}{nonce}{body}"
+    hex_sig    = hmac.new(secret.encode(), prehash.encode(), hashlib.sha256).hexdigest()
+    return base64.b64encode(hex_sig.encode()).decode()
+
+
+def _auth_headers(method: str, path: str, body: str = "") -> dict:
+    ts    = str(int(time.time() * 1000))
+    nonce = str(_uuid.uuid4())
+    return {
+        "ACCESS-KEY":        BLOFIN_API_KEY,
+        "ACCESS-SIGN":       _sign(BLOFIN_API_SECRET, path, method, ts, nonce, body),
+        "ACCESS-TIMESTAMP":  ts,
+        "ACCESS-NONCE":      nonce,
+        "ACCESS-PASSPHRASE": BLOFIN_API_PASSPHRASE,
+        "Content-Type":      "application/json",
+    }
+
+
+# ── Client ────────────────────────────────────────────────────────────────────
+
+class BloFinClient:
+    """
+    Async REST client. Use as async context manager or call init()/close().
+    All public methods raise BloFinAPIError on unrecoverable errors.
+    """
+
+    class BloFinAPIError(Exception):
+        def __init__(self, code: int, msg: str, detail: dict = None):
+            self.code = code
+            self.msg  = msg
+            self.detail = detail or {}
+            super().__init__(f"[{code}] {msg}")
 
     def __init__(self):
-        self._public_ws:  Optional[websockets.WebSocketClientProtocol] = None
-        self._private_ws: Optional[websockets.WebSocketClientProtocol] = None
-        self._subscriptions: Set[str] = set()   # "channel:instId" strings
-        self._callbacks: Dict[str, List[WSCallback]] = {}
-        self._running = False
-        self._ticker_cache: Dict[str, dict] = {}    # inst_id → latest ticker
+        self._session: Optional[aiohttp.ClientSession] = None
+        self._connector: Optional[aiohttp.TCPConnector] = None
 
-    # ── Public API ────────────────────────────────────────────────────────────
+    async def init(self) -> None:
+        self._connector = aiohttp.TCPConnector(limit=20, ttl_dns_cache=300)
+        timeout = aiohttp.ClientTimeout(total=10, connect=5)
+        self._session = aiohttp.ClientSession(
+            connector=self._connector,
+            timeout=timeout,
+            base_url=BLOFIN_REST_URL,
+        )
+        log.info("BloFin REST client ready (mode=%s)", "PAPER" if IS_PAPER else "LIVE")
 
-    def on(self, channel: str, callback: WSCallback) -> None:
-        """Register a callback for a channel (e.g., 'tickers', 'orders')."""
-        self._callbacks.setdefault(channel, []).append(callback)
+    async def close(self) -> None:
+        if self._session:
+            await self._session.close()
+        if self._connector:
+            await self._connector.close()
+        log.info("BloFin REST client closed")
 
-    async def subscribe_tickers(self, inst_ids: List[str]) -> None:
-        for iid in inst_ids:
-            self._subscriptions.add(f"tickers:{iid}")
+    async def __aenter__(self):
+        await self.init()
+        return self
 
-    async def subscribe_orders(self) -> None:
-        self._subscriptions.add("orders:SWAP")
+    async def __aexit__(self, *_):
+        await self.close()
 
-    async def subscribe_funding(self, inst_ids: List[str]) -> None:
-        for iid in inst_ids:
-            self._subscriptions.add(f"funding-rate:{iid}")
+    # ── Core request ─────────────────────────────────────────────────────────
 
-    def get_ticker(self, inst_id: str) -> Optional[dict]:
-        """Get latest cached ticker. Returns None if not yet received."""
-        return self._ticker_cache.get(inst_id)
-
-    def get_bid_ask(self, inst_id: str) -> tuple:
-        ticker = self._ticker_cache.get(inst_id, {})
-        return float(ticker.get("bidPx", 0)), float(ticker.get("askPx", 0))
-
-    async def start(self) -> None:
-        """Start both WebSocket connections as background tasks."""
-        self._running = True
-        asyncio.create_task(self._run_public())
-        asyncio.create_task(self._run_private())
-        log.info("WebSocket manager started")
-
-    async def stop(self) -> None:
-        self._running = False
-        for ws in [self._public_ws, self._private_ws]:
-            if ws:
-                await ws.close()
-        log.info("WebSocket manager stopped")
-
-    # ── Public WebSocket (market data) ────────────────────────────────────────
-
-    async def _run_public(self) -> None:
-        backoff = SYSTEM["api_backoff_seconds"]
-        attempt = 0
-        while self._running:
-            try:
-                log.info("Public WS connecting...")
-                async with websockets.connect(
-                    BLOFIN_WS_PUBLIC,
-                    ping_interval=SYSTEM["ws_ping_interval_seconds"],
-                    ping_timeout=SYSTEM["ws_ping_timeout_seconds"],
-                ) as ws:
-                    self._public_ws = ws
-                    attempt = 0
-                    log.info("Public WS connected")
-
-                    # Subscribe to all market channels
-                    pub_subs = [s for s in self._subscriptions
-                                 if not s.startswith("orders")]
-                    if pub_subs:
-                        await self._send_subscribe(ws, pub_subs)
-
-                    async for raw in ws:
-                        await self._handle_message(raw, "public")
-
-            except ConnectionClosed as e:
-                log.warning("Public WS closed: %s", e)
-            except Exception as e:
-                log.error("Public WS error: %s", e)
-
-            if not self._running:
-                break
-            delay = backoff[min(attempt, len(backoff) - 1)]
-            log.info("Public WS reconnecting in %ds (attempt %d)...", delay, attempt + 1)
-            await asyncio.sleep(delay)
-            attempt += 1
-
-    # ── Private WebSocket (orders/fills) ─────────────────────────────────────
-
-    async def _run_private(self) -> None:
-        if not BLOFIN_API_KEY:
-            log.info("Private WS skipped (no API key)")
-            return
-
-        backoff = SYSTEM["api_backoff_seconds"]
-        attempt = 0
-        while self._running:
-            try:
-                log.info("Private WS connecting...")
-                async with websockets.connect(
-                    BLOFIN_WS_PRIVATE,
-                    ping_interval=SYSTEM["ws_ping_interval_seconds"],
-                    ping_timeout=SYSTEM["ws_ping_timeout_seconds"],
-                ) as ws:
-                    self._private_ws = ws
-                    attempt = 0
-
-                    # Authenticate
-                    ts, sig = _ws_sign(BLOFIN_API_SECRET)
-                    await ws.send(json.dumps({
-                        "op": "login",
-                        "args": [{
-                            "apiKey":     BLOFIN_API_KEY,
-                            "passphrase": BLOFIN_API_PASSPHRASE,
-                            "timestamp":  ts,
-                            "sign":       sig,
-                        }],
-                    }))
-                    # Wait for login confirmation
-                    auth_resp = await asyncio.wait_for(ws.recv(), timeout=10)
-                    log.debug("Private WS auth response: %s", auth_resp)
-
-                    # Subscribe to private channels
-                    priv_subs = [s for s in self._subscriptions
-                                  if s.startswith("orders")]
-                    if priv_subs:
-                        await self._send_subscribe(ws, priv_subs)
-
-                    log.info("Private WS authenticated and subscribed")
-
-                    async for raw in ws:
-                        await self._handle_message(raw, "private")
-
-            except asyncio.TimeoutError:
-                log.warning("Private WS auth timeout")
-            except ConnectionClosed as e:
-                log.warning("Private WS closed: %s", e)
-            except Exception as e:
-                log.error("Private WS error: %s", e)
-
-            if not self._running:
-                break
-            delay = backoff[min(attempt, len(backoff) - 1)]
-            await asyncio.sleep(delay)
-            attempt += 1
-
-    # ── Message handling ──────────────────────────────────────────────────────
-
-    async def _handle_message(self, raw: str, source: str) -> None:
+    @retry(
+        stop=stop_after_attempt(SYSTEM["api_retry_attempts"]),
+        wait=wait_exponential(multiplier=1, min=1, max=300),
+        retry=retry_if_exception_type((aiohttp.ClientError, asyncio.TimeoutError)),
+        reraise=True,
+    )
+    async def _request(self, method: str, path: str, params: dict = None,
+                        body: dict = None, signed: bool = False) -> dict:
         try:
-            msg = json.loads(raw)
-        except json.JSONDecodeError:
+            # Build full path including query string — BloFin signs the full path
+            if params:
+                query_string = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
+                full_path = f"{path}?{query_string}"
+            else:
+                full_path = path
+
+            body_str = json.dumps(body) if body else ""
+            headers  = _auth_headers(method, full_path, body_str) if signed else {"Content-Type": "application/json"}
+
+            async with self._session.request(
+                method, path,
+                params=params,
+                data=body_str if body_str else None,
+                headers=headers,
+            ) as resp:
+                raw = await resp.json(content_type=None)
+
+                if resp.status == 429:
+                    log.warning("Rate limited — sleeping 2 s")
+                    await asyncio.sleep(2)
+                    raise aiohttp.ClientError("rate_limit")
+
+                if resp.status >= 500:
+                    raise aiohttp.ClientError(f"server_error_{resp.status}")
+
+                # Some BloFin endpoints return a raw list with no code/data wrapper
+                if isinstance(raw, list):
+                    return raw
+
+                code = raw.get("code", "0")
+                if str(code) not in ("0", "200"):
+                    raise self.BloFinAPIError(int(code), raw.get("msg", "unknown"), raw)
+
+                return raw.get("data", raw)
+
+        except self.BloFinAPIError:
+            raise
+        except Exception as e:
+            log.warning("Request error %s %s: %s", method, path, e)
+            raise
+
+    # ── Market data ──────────────────────────────────────────────────────────
+
+    async def get_ticker(self, inst_id: str) -> dict:
+        """Current best bid/ask, last price, 24h volume."""
+        data = await self._request("GET", "/api/v1/market/tickers",
+                                    params={"instId": inst_id})
+        return data[0] if isinstance(data, list) else data
+
+    async def get_tickers(self, inst_type: str = "SWAP") -> List[dict]:
+        """All tickers for given instrument type."""
+        return await self._request("GET", "/api/v1/market/tickers",
+                                    params={"instType": inst_type})
+
+    async def get_orderbook(self, inst_id: str, depth: int = 20) -> dict:
+        """Order book with bids and asks."""
+        data = await self._request("GET", "/api/v1/market/books",
+                                    params={"instId": inst_id, "sz": str(depth)})
+        # BloFin returns data as a list — take first element
+        return data[0] if isinstance(data, list) and data else (data or {})
+
+    async def get_candles(self, inst_id: str, bar: str = "1H",
+                           limit: int = 100) -> List[list]:
+        """
+        OHLCV candles. bar format: 1m, 5m, 15m, 1H, 4H, 1D
+        Returns list of [ts, open, high, low, close, vol, volCcy]
+        """
+        data = await self._request(
+            "GET", "/api/v1/market/candles",
+            params={"instId": inst_id, "bar": bar, "limit": str(limit)},
+        )
+        return data if isinstance(data, list) else []
+
+    async def get_funding_rate(self, inst_id: str) -> dict:
+        """Current and next funding rate for a perpetual."""
+        data = await self._request("GET", "/api/v1/public/funding-rate",
+                                    params={"instId": inst_id})
+        if isinstance(data, list):
+            return data[0] if data else {}
+        return data or {}
+
+    async def get_mark_price(self, inst_id: str) -> float:
+        data = await self._request("GET", "/api/v1/public/mark-price",
+                                    params={"instId": inst_id, "instType": "SWAP"})
+        rows = data if isinstance(data, list) else [data]
+        for row in rows:
+            if row.get("instId") == inst_id:
+                return float(row.get("markPx", 0))
+        return 0.0
+
+    # ── Account ───────────────────────────────────────────────────────────────
+
+    async def get_balance(self) -> dict:
+        """Futures account balance — used for all trading operations."""
+        # Trading section endpoint, not the spot account balance
+        data = await self._request("GET", "/api/v1/account/balance", signed=True)
+        if isinstance(data, list):
+            return data[0] if data else {}
+        return data or {}
+
+    async def get_futures_balance(self) -> dict:
+        """Alternative futures balance endpoint."""
+        data = await self._request("GET", "/api/v1/account/futures-balance", signed=True)
+        if isinstance(data, list):
+            return data[0] if data else {}
+        return data or {}
+
+    async def get_usdt_balance(self) -> float:
+        """Return available USDT equity for futures trading."""
+        # Try futures-specific balance first, fall back to general balance
+        try:
+            bal = await self.get_futures_balance()
+            if bal:
+                details = bal.get("details", [])
+                for item in details:
+                    if item.get("currency") == "USDT":
+                        return float(item.get("equity") or item.get("available") or 0)
+                if bal.get("totalEquity"):
+                    return float(bal["totalEquity"])
+        except Exception:
+            pass
+
+        # Fall back to general account balance
+        bal = await self.get_balance()
+        details = bal.get("details", [])
+        for item in details:
+            if item.get("currency") == "USDT":
+                val = float(item.get("equity") or item.get("available") or 0)
+                log.info("USDT balance: %.2f", val)
+                return val
+        if bal.get("totalEquity"):
+            return float(bal["totalEquity"])
+        log.warning("Could not parse balance: %s", str(bal)[:300])
+        return 0.0
+
+    async def get_positions(self, inst_id: str = None) -> List[dict]:
+        """All open positions on the account."""
+        params = {"instType": "SWAP"}
+        if inst_id:
+            params["instId"] = inst_id
+        data = await self._request("GET", "/api/v1/account/positions",
+                                    params=params, signed=True)
+        return data if isinstance(data, list) else []
+
+    async def set_leverage(self, inst_id: str, leverage: int,
+                            margin_mode: str = "cross") -> dict:
+        """Set leverage for an instrument before trading."""
+        body = {
+            "instId":     inst_id,
+            "leverage":   str(leverage),
+            "marginMode": margin_mode,
+        }
+        try:
+            result = await self._request("POST", "/api/v1/account/set-leverage",
+                                          body=body, signed=True)
+            log.info("Leverage set: %s %dx %s", inst_id, leverage, margin_mode)
+            return result
+        except Exception as e:
+            log.warning("set_leverage failed for %s: %s", inst_id, e)
+            return {}
+
+    async def get_instruments(self, inst_type: str = "SWAP") -> List[dict]:
+        """Get instrument specs including minimum order size (minSz) and contract value."""
+        data = await self._request("GET", "/api/v1/public/instruments",
+                                    params={"instType": inst_type})
+        return data if isinstance(data, list) else []
+
+    async def get_min_size(self, inst_id: str) -> float:
+        """Return minimum order size for an instrument. Defaults to 1."""
+        instruments = await self.get_instruments()
+        for inst in instruments:
+            if inst.get("instId") == inst_id:
+                return float(inst.get("minSize") or inst.get("minSz") or 1)
+        return 1.0
+
+    # ── Order management ──────────────────────────────────────────────────────
+
+    async def place_order(self, inst_id: str, side: str, order_type: str,
+                           size: float, price: float = None,
+                           tp_price: float = None, sl_price: float = None,
+                           reduce_only: bool = False,
+                           client_order_id: str = None) -> dict:
+        """
+        Place a single order.
+        side: "buy" | "sell"
+        order_type: "limit" | "market"
+        Returns full exchange response.
+        """
+        if client_order_id is None:
+            # BloFin: only letters, numbers, underscores, max 32 chars
+            client_order_id = f"bb_{uuid.uuid4().hex[:16]}"
+
+        body: Dict[str, Any] = {
+            "instId":     inst_id,
+            "marginMode": "cross",
+            "side":       side.lower(),
+            "orderType":  order_type.lower(),
+            # Send as integer string if whole number, e.g. "1" not "1.0"
+            "size":       str(int(size)) if size == int(size) else str(round(size, 4)),
+            "clientOrderId": client_order_id,
+        }
+        if price and order_type.lower() == "limit":
+            body["price"] = str(round(price, 2))
+        if reduce_only:
+            body["reduceOnly"] = "true"
+        if tp_price:
+            body["tpTriggerPrice"] = str(round(tp_price, 2))   # BloFin field name
+            body["tpOrderPrice"]   = "-1"
+        if sl_price:
+            body["slTriggerPrice"] = str(round(sl_price, 2))   # BloFin field name
+            body["slOrderPrice"]   = "-1"
+
+        # Both PAPER and LIVE send real orders — PAPER uses demo exchange URL
+        result = await self._request("POST", "/api/v1/trade/order",
+                                      body=body, signed=True)
+        mode = "DEMO" if IS_PAPER else "LIVE"
+        log.info("[%s] ORDER PLACED: %s %s %s @ %s sz=%s -> %s",
+                  mode, inst_id, side, order_type, price, size,
+                  result.get("ordId") if isinstance(result, dict) else result)
+        return result
+
+    async def cancel_order(self, inst_id: str, order_id: str = None,
+                            client_order_id: str = None) -> dict:
+        body: Dict[str, Any] = {"instId": inst_id}
+        if order_id:
+            body["orderId"] = order_id
+        elif client_order_id:
+            body["clientOrderId"] = client_order_id
+        else:
+            raise ValueError("Must provide order_id or client_order_id")
+
+        return await self._request("POST", "/api/v1/trade/cancel-order",
+                                    body=body, signed=True)
+
+    async def cancel_all_orders(self, inst_id: str) -> None:
+        """Cancel every pending order for an instrument."""
+        pending = await self.get_pending_orders(inst_id)
+        if not pending:
             return
+        tasks = [
+            self.cancel_order(inst_id, order_id=o.get("orderId") or o.get("ordId"))
+            for o in pending
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for r in results:
+            if isinstance(r, Exception):
+                log.warning("Cancel error: %s", r)
 
-        if msg.get("event") in ("subscribe", "login", "error"):
-            log.debug("WS event [%s]: %s", source, msg)
-            return
+    async def get_pending_orders(self, inst_id: str = None) -> List[dict]:
+        params = {"instType": "SWAP"}
+        if inst_id:
+            params["instId"] = inst_id
+        data = await self._request("GET", "/api/v1/trade/orders-pending",
+                                    params=params, signed=True)
+        return data if isinstance(data, list) else []
 
-        channel = msg.get("arg", {}).get("channel", "")
-        inst_id = msg.get("arg", {}).get("instId", "")
-        data    = msg.get("data", [])
+    async def get_order(self, inst_id: str, order_id: str = None,
+                         client_order_id: str = None) -> Optional[dict]:
+        params = {"instId": inst_id}
+        if order_id:
+            params["orderId"] = order_id
+        elif client_order_id:
+            params["clientOrderId"] = client_order_id
+        data = await self._request("GET", "/api/v1/trade/order",
+                                    params=params, signed=True)
+        return data if isinstance(data, dict) else (data[0] if data else None)
 
-        if not channel or not data:
-            return
+    async def close_position(self, inst_id: str, side: str,
+                              size: float) -> dict:
+        """Close position at market. side = direction of existing position."""
+        close_side = "sell" if side.lower() in ("long", "buy") else "buy"
+        return await self.place_order(
+            inst_id=inst_id,
+            side=close_side,
+            order_type="market",
+            size=size,
+            reduce_only=True,
+        )
 
-        # Cache tickers
-        if channel == "tickers" and data:
-            self._ticker_cache[inst_id] = data[0]
+    # ── Set TP/SL on existing position (algo order) ───────────────────────────
 
-        # Dispatch to registered callbacks
-        callbacks = self._callbacks.get(channel, [])
-        for cb in callbacks:
-            try:
-                await cb(channel, inst_id, data[0] if data else {})
-            except Exception as e:
-                log.warning("WS callback error [%s]: %s", channel, e)
+    async def set_tp_sl(self, inst_id: str, pos_side: str,
+                         tp_price: float = None, sl_price: float = None) -> dict:
+        body: Dict[str, Any] = {
+            "instId":     inst_id,
+            "marginMode": "cross",
+            "posSide":    pos_side,
+        }
+        if tp_price:
+            body["tpTriggerPrice"] = str(round(tp_price, 2))
+            body["tpOrderPrice"]   = "-1"
+        if sl_price:
+            body["slTriggerPrice"] = str(round(sl_price, 2))
+            body["slOrderPrice"]   = "-1"
 
-    async def _send_subscribe(self, ws, subscriptions: List[str]) -> None:
-        args = []
-        for sub in subscriptions:
-            parts = sub.split(":", 1)
-            channel = parts[0]
-            inst_id = parts[1] if len(parts) > 1 else ""
-            arg = {"channel": channel}
-            if inst_id:
-                arg["instId"] = inst_id
-            args.append(arg)
+        return await self._request("POST", "/api/v1/trade/order-algo",
+                                    body=body, signed=True)
 
-        await ws.send(json.dumps({"op": "subscribe", "args": args}))
-        log.info("WS subscribed: %s", [s for s in subscriptions])
+    # ── Convenience: mid price ────────────────────────────────────────────────
+
+    async def get_mid_price(self, inst_id: str) -> float:
+        ob = await self.get_orderbook(inst_id, depth=1)
+        bids = ob.get("bids", [[0]])
+        asks = ob.get("asks", [[0]])
+        best_bid = float(bids[0][0]) if bids else 0
+        best_ask = float(asks[0][0]) if asks else 0
+        return (best_bid + best_ask) / 2 if (best_bid and best_ask) else 0.0
+
+    async def get_best_bid_ask(self, inst_id: str) -> tuple:
+        ob = await self.get_orderbook(inst_id, depth=1)
+        bids = ob.get("bids", [[0]])
+        asks = ob.get("asks", [[0]])
+        return (float(bids[0][0]) if bids else 0,
+                float(asks[0][0]) if asks else 0)
 
 
-# ── Singleton ─────────────────────────────────────────────────────────────────
+# ── Singleton factory ─────────────────────────────────────────────────────────
 
-_ws: Optional[BloFinWebSocket] = None
+_client: Optional[BloFinClient] = None
 
 
-def get_ws() -> BloFinWebSocket:
-    global _ws
-    if _ws is None:
-        _ws = BloFinWebSocket()
-    return _ws
+async def get_client() -> BloFinClient:
+    global _client
+    if _client is None:
+        _client = BloFinClient()
+        await _client.init()
+    return _client

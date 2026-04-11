@@ -1,265 +1,256 @@
 """
-config.py — Central configuration for the BloFin 7-Bot Trading System.
-All constants live here. Bots read from this module only — no hardcoded
-values anywhere else in the codebase.
+commentary.py — Human-readable trade commentary generator.
+
+Every trade that passes through the system gets two commentary blocks:
+
+  entry_commentary: "What triggered this trade, what the indicators showed,
+                      why the risk engine approved it."
+
+  forward_strategy: "What happens from here — TP target, SL level,
+                      exit conditions, any add-on rules, time limits."
+
+These are stored in the position/trade metadata and displayed on the dashboard.
+They make dry-run review meaningful: you can see exactly what the bot was thinking.
 """
 
-import os
-from decimal import Decimal
-from dotenv import load_dotenv
+from typing import Dict, Any, Optional
+from datetime import datetime, timezone
 
-load_dotenv()
 
-# ============================================================
-# API CREDENTIALS
-# ============================================================
-def _clean(val: str) -> str:
-    """Strip quotes and whitespace Railway sometimes wraps around env var values."""
-    return val.strip().strip('"').strip("'").strip()
+def generate_entry_commentary(
+    bot_id:     str,
+    inst_id:    str,
+    direction:  str,
+    entry_price: float,
+    sl_price:   float,
+    tp_price:   Optional[float],
+    kelly_frac: float,
+    size_usdt:  float,
+    metadata:   Dict[str, Any],
+) -> Dict[str, str]:
+    """
+    Returns {"trigger": "...", "forward_strategy": "...", "summary": "..."}
+    """
+    trigger          = _build_trigger(bot_id, direction, inst_id, entry_price, metadata)
+    forward_strategy = _build_forward(bot_id, direction, entry_price,
+                                       sl_price, tp_price, size_usdt, kelly_frac, metadata)
+    risk_pct = abs(entry_price - sl_price) / entry_price * 100
 
-BLOFIN_API_KEY        = _clean(os.getenv("BLOFIN_API_KEY", ""))
-BLOFIN_API_SECRET     = _clean(os.getenv("BLOFIN_API_SECRET", ""))
-BLOFIN_API_PASSPHRASE = _clean(os.getenv("BLOFIN_API_PASSPHRASE", ""))
+    summary = (
+        f"{direction} {inst_id} @ {entry_price:.4f} | "
+        f"Risk: {risk_pct:.2f}% | "
+        f"Size: ${size_usdt:.0f} | "
+        f"Kelly: {kelly_frac*100:.1f}%"
+    )
 
-# ============================================================
-# ENVIRONMENT — must be defined before URLs
-# ============================================================
-TRADING_MODE = _clean(os.getenv("TRADING_MODE", "paper"))
-IS_LIVE      = TRADING_MODE == "live"
-IS_PAPER     = not IS_LIVE
+    return {
+        "trigger":          trigger,
+        "forward_strategy": forward_strategy,
+        "summary":          summary,
+        "generated_at":     datetime.now(timezone.utc).isoformat(),
+        "bot_id":           bot_id,
+    }
 
-DATABASE_URL = _clean(os.getenv("DATABASE_URL", ""))
-REDIS_URL    = _clean(os.getenv("REDIS_URL", "redis://localhost:6379/0"))
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
+def generate_exit_commentary(
+    bot_id:       str,
+    inst_id:      str,
+    side:         str,
+    entry_price:  float,
+    exit_price:   float,
+    size:         float,
+    net_pnl:      float,
+    close_reason: str,
+    duration_s:   int,
+    metadata:     Dict[str, Any],
+) -> str:
+    """Returns a plain-language exit description."""
+    direction  = "Long" if side == "LONG" else "Short"
+    pnl_emoji  = "✅" if net_pnl >= 0 else "❌"
+    pnl_pct    = abs(exit_price - entry_price) / entry_price * 100
+    won        = net_pnl >= 0
+    duration   = _format_duration(duration_s)
 
-# ============================================================
-# API URLS — demo vs live
-# ============================================================
-BLOFIN_REST_URL   = "https://demo-trading-openapi.blofin.com"            if IS_PAPER else "https://openapi.blofin.com"
-BLOFIN_WS_PUBLIC  = "wss://demo-trading-openapi.blofin.com/ws/public"   if IS_PAPER else "wss://openapi.blofin.com/ws/public"
-BLOFIN_WS_PRIVATE = "wss://demo-trading-openapi.blofin.com/ws/private"  if IS_PAPER else "wss://openapi.blofin.com/ws/private"
+    reason_map = {
+        "paper_TP":                  f"{pnl_emoji} Take-profit hit at {exit_price:.4f} (+{pnl_pct:.2f}%). Trade worked as planned.",
+        "paper_SL":                  f"{pnl_emoji} Stop-loss triggered at {exit_price:.4f} (-{pnl_pct:.2f}%). Setup invalidated — price moved against the thesis.",
+        "time_exit":                 f"⏱️ Time exit after {duration}. Price hadn't reached TP or SL — flat exit to free capital.",
+        "mean_reversion_tp":         f"{pnl_emoji} Mean-reversion target reached. Price reverted {pnl_pct:.2f}% toward the 20-SMA.",
+        "first_target_long":         f"📈 First target hit (+{pnl_pct:.2f}%). 50% of position closed, trailing stop now protecting the rest.",
+        "first_target_short":        f"📉 First target hit (+{pnl_pct:.2f}%). 50% of position closed, trailing stop now protecting the rest.",
+        "funding_rate_normalised":   f"💸 Funding rate fell below exit threshold. Collected funding and exited cleanly.",
+        "funding_rate_declining":    f"💸 Funding rate declining for 2+ consecutive periods — exit before edge disappears.",
+        "loss_exceeds_collected_funding": f"⚠️ Unrealized loss exceeded 2× collected funding. Emergency exit to protect capital.",
+        "rebalance":                 f"🔄 Rebalance: asset no longer in top/bottom momentum tier. Position rotated.",
+        "reconcile_not_found_on_exchange": f"⚠️ Position not found on exchange during startup reconcile — marked closed.",
+    }
 
-# ============================================================
-# UNIVERSAL RISK ENGINE — NON-NEGOTIABLE
-# ============================================================
-RISK = {
-    "max_daily_drawdown_pct":    float(os.getenv("MAX_DAILY_DRAWDOWN_PCT",  "6.0")),
-    "max_monthly_drawdown_pct":  15.0,
-    "max_trade_risk_pct":        float(os.getenv("MAX_TRADE_RISK_PCT",      "2.0")),
-    "max_concurrent_positions":  int(os.getenv("MAX_CONCURRENT_POSITIONS",  "12")),
-    "max_bot_allocation_pct":    float(os.getenv("MAX_BOT_ALLOCATION_PCT",  "20.0")),
-    "vol_kill_multiplier":       3.0,    # halt if 1h vol > 3× 7-day avg
-    "vol_lookback_hours":        168,    # 7 days
-    "news_blackout_minutes_pre": 5,
-    "news_blackout_minutes_post":10,
-    "correlation_max":           0.85,   # block new position if correlation > this
-    "correlation_lookback_days": 30,
-    "kelly_fraction":            0.5,    # half-Kelly always
-    "min_edge_ratio":            2.0,    # min risk:reward to take a trade
-}
+    explanation = reason_map.get(
+        close_reason,
+        f"Closed: {close_reason.replace('_', ' ')}. P&L: {net_pnl:+.2f} USDT ({'+' if won else ''}{pnl_pct:.2f}%)."
+    )
 
-# ============================================================
-# ASSETS
-# ============================================================
-PRIMARY_ASSETS = ["BTC-USDT", "ETH-USDT", "SOL-USDT"]
-QUOTE_CURRENCY = "USDT"
+    return (
+        f"{explanation}\n"
+        f"Held for {duration}. "
+        f"Entry {entry_price:.4f} → Exit {exit_price:.4f}. "
+        f"Net P&L: {net_pnl:+.2f} USDT."
+    )
 
-# Instrument type for BloFin perpetuals
-INST_TYPE = "swap"   # perpetual futures
 
-# ============================================================
-# BOT 1 — MOMENTUM SCALPER
-# ============================================================
-BOT1 = {
-    "id":              "bot1_scalper",
-    "name":            "Momentum Scalper",
-    "assets":          ["BTC-USDT", "ETH-USDT", "SOL-USDT"],
-    "timeframe_signal":"5m",
-    "timeframe_entry": "1m",
-    "rsi_period":       14,
-    "rsi_long_threshold":  55,
-    "rsi_short_threshold": 45,
-    "volume_multiplier":   1.5,       # vol must be > 1.5× 20-bar avg
-    "volume_lookback":     20,
-    "ema_period":          20,
-    "spread_max_pct":      0.05,      # max spread % to enter
-    "tp_pct":              0.50,      # 0.50% take profit
-    "sl_pct":              0.25,      # 0.25% stop loss
-    "time_exit_minutes":   8,         # exit if not TP'd within 8 min
-    "max_trades_per_hour": 6,         # per asset
-    "cooldown_seconds":    180,       # 3 min after any close
-    "atr_period":          14,
-    "atr_min_multiplier":  1.0,       # don't trade if ATR < 30-bar avg × this
-    "atr_lookback":        30,
-    "max_account_pct":     0.20,      # bot-level allocation cap
-    "enabled":             True,
-}
+# ── Per-bot trigger builders ──────────────────────────────────────────────────
 
-# ============================================================
-# BOT 2 — TREND FOLLOWER
-# ============================================================
-BOT2 = {
-    "id":              "bot2_trend",
-    "name":            "Trend Follower",
-    "assets":          ["BTC-USDT", "ETH-USDT", "SOL-USDT"],
-    "timeframe_signal":"4h",
-    "timeframe_trend": "1d",
-    "ema_fast":         50,
-    "ema_slow":         200,
-    "ema_cross_lookback":5,          # cross must have happened in last 5 bars
-    "adx_period":       14,
-    "adx_min":          25,           # trend strength minimum
-    "adx_full_kelly":   40,           # ADX above this = full Kelly
-    "rsi_period":       14,
-    "rsi_min":          45,
-    "rsi_max":          65,           # don't enter if overbought/oversold
-    "atr_period":       14,
-    "trailing_atr_mult":2.0,          # trailing stop = 2× ATR
-    "partial_exit_pct": 0.50,         # take 50% off at first target
-    "first_target_pct": 4.0,          # 4% profit = partial exit
-    "max_account_pct":  0.20,
-    "no_weekend_below_vol_percentile": 50,   # don't trade weekends in low vol
-    "enabled":          True,
-}
+def _build_trigger(bot_id: str, direction: str, inst_id: str,
+                    entry_price: float, meta: Dict) -> str:
+    m = meta
 
-# ============================================================
-# BOT 3 — MEAN REVERSION
-# ============================================================
-BOT3 = {
-    "id":              "bot3_meanrev",
-    "name":            "Mean Reversion",
-    "assets":          ["BTC-USDT", "ETH-USDT"],
-    "timeframe_signal":"1h",
-    "rsi_period":       14,
-    "rsi_oversold":     28,
-    "rsi_overbought":   72,
-    "bb_period":        20,
-    "bb_std":           2.0,
-    "adx_period":       14,
-    "adx_max":          20,           # ONLY trade when market is ranging (ADX < 20)
-    "mean_period":      20,           # reversion target = 20-SMA
-    "tp_reversion_pct": 0.50,         # TP at 50% reversion to mean
-    "sl_pct":           1.50,         # 1.5% stop loss
-    "confirm_bars":     1,            # wait for 1 bar back inside BB before entering
-    "max_account_pct":  0.20,
-    "enabled":          True,
-}
+    if bot_id == "bot1_scalper":
+        rsi  = m.get("rsi",  "—")
+        vol  = m.get("vol_ratio", "—")
+        side = "crossed ABOVE 55" if direction == "LONG" else "crossed BELOW 45"
+        ema_rel = "above" if direction == "LONG" else "below"
+        return (
+            f"5-minute RSI {side} (current: {rsi:.1f}) "
+            f"with volume {vol:.1f}× the 20-bar average. "
+            f"Price is {ema_rel} the 20 EMA — momentum confirmed."
+        )
 
-# ============================================================
-# BOT 4 — MARKET MAKER
-# ============================================================
-BOT4 = {
-    "id":              "bot4_mm",
-    "name":            "Market Maker",
-    "assets":          ["BTC-USDT", "ETH-USDT"],
-    "spread_target_pct":    0.06,     # quote ±0.06% from mid
-    "quote_refresh_seconds":10,
-    "inventory_max_pct":    0.50,     # max inventory imbalance (% of account)
-    "skew_threshold_ratio": 3.0,      # skew if one side fills 3× more
-    "skew_adjustment_pct":  0.03,     # skew by 0.03%
-    "inventory_loss_max_pct":1.0,     # flatten if unrealized loss > 1%
-    "pause_minutes_after_loss":30,
-    "vol_max_1h_pct":       2.5,      # pause if 1h vol > 2.5%
-    "max_account_pct":      0.20,
-    "enabled":              True,
-}
+    elif bot_id == "bot2_trend":
+        adx = m.get("adx", "—")
+        rsi = m.get("rsi", "—")
+        cross = "Golden cross (50 EMA crossed above 200 EMA)" if direction == "LONG" \
+                else "Death cross (50 EMA crossed below 200 EMA)"
+        slope = "upward" if direction == "LONG" else "downward"
+        return (
+            f"{cross} confirmed within last 5 bars on 4H chart. "
+            f"1D 200 EMA slope is {slope}. "
+            f"ADX: {adx:.1f} (trend strength confirmed above 25). "
+            f"RSI: {rsi:.1f} (within 45–65 neutral zone — not overbought/oversold at entry)."
+        )
 
-# ============================================================
-# BOT 5 — BREAKOUT HUNTER
-# ============================================================
-BOT5 = {
-    "id":              "bot5_breakout",
-    "name":            "Breakout Hunter",
-    "assets":          ["BTC-USDT", "ETH-USDT", "SOL-USDT"],
-    "timeframe_signal":"1h",
-    "timeframe_confirm":"4h",
-    "consolidation_bars":    20,      # look back 20 bars
-    "consolidation_range_pct":2.5,   # range must be < 2.5%
-    "volume_multiplier":     2.0,     # breakout bar vol > 2× 20-bar avg
-    "volume_lookback":       20,
-    "retest_bars_max":       3,       # retest must come within 3 bars
-    "add_on_retest_pct":     0.50,    # add 50% position on confirmed retest
-    "tp_multiplier":         1.5,     # TP = 1.5× box height from breakout
-    "sl_back_inside":        True,    # SL = back inside the box (invalidation)
-    "max_boxes_monitored":   5,       # max simultaneous setups per asset
-    "max_account_pct":       0.20,
-    "enabled":               True,
-}
+    elif bot_id == "bot3_meanrev":
+        adx = m.get("adx", "—")
+        rsi = m.get("rsi", "—")
+        sma = m.get("sma", entry_price)
+        bb_side = "below the lower Bollinger Band" if direction == "LONG" else "above the upper Bollinger Band"
+        rsi_cond = f"oversold (RSI {rsi:.1f} < 28)" if direction == "LONG" else f"overbought (RSI {rsi:.1f} > 72)"
+        return (
+            f"Market is ranging: ADX {adx:.1f} < 20 (no trend). "
+            f"Price closed {bb_side} on the prior bar, confirming extreme — "
+            f"then closed back inside on this bar (1-bar confirmation). "
+            f"RSI is {rsi_cond}. "
+            f"20-SMA target: {float(sma):.4f}."
+        )
 
-# ============================================================
-# BOT 6 — FUNDING RATE ARBITRAGE
-# ============================================================
-BOT6 = {
-    "id":              "bot6_funding",
-    "name":            "Funding Rate Arb",
-    "assets":          ["BTC-USDT", "ETH-USDT", "SOL-USDT"],
-    "funding_interval_hours": 8,
-    "funding_entry_threshold":0.05,   # enter if 8h rate > +0.05%
-    "funding_exit_threshold": 0.01,   # exit if rate falls below 0.01%
-    "funding_exit_consecutive":2,     # AND has fallen for 2 consecutive periods
-    "funding_negative_threshold":-0.03,  # reverse position if rate < -0.03%
-    "min_funding_payments":   3,      # hold for at least 3 payments
-    "basis_max_pct":          0.20,   # max spot-perp basis to enter
-    "loss_vs_collected_max":  2.0,    # exit if loss > 2× collected funding
-    "max_account_pct":        0.20,
-    "enabled":                True,
-}
+    elif bot_id == "bot5_breakout":
+        box_high  = m.get("box_high", 0)
+        box_low   = m.get("box_low", 0)
+        box_h     = m.get("box_height", 0)
+        is_retest = m.get("retest", False)
+        retest_note = " Price then pulled back to test the broken level and held — retest confirmed, higher-confidence entry." if is_retest else " No retest occurred — entry at breakout close."
+        side_desc = "resistance" if direction == "LONG" else "support"
+        return (
+            f"Consolidation box detected: {box_low:.4f} – {box_high:.4f} "
+            f"(range: {box_h:.4f}, within 2.5% threshold). "
+            f"This bar closed outside {side_desc} on volume > 2× the 20-bar average — "
+            f"breakout confirmed.{retest_note}"
+        )
 
-# ============================================================
-# BOT 7 — MULTI-ASSET MOMENTUM DIVERSIFICATION
-# ============================================================
-BOT7 = {
-    "id":              "bot7_momentum",
-    "name":            "Multi-Asset Momentum",
-    "assets":          [],             # empty — universe built dynamically at runtime
-    "universe_size":   10,            # top 10 assets by 30-day volume
-    "momentum_period": 20,            # 20-day momentum score
-    "atr_period":      20,
-    "long_count":      3,             # go long top 3
-    "short_count":     2,             # go short bottom 2
-    "long_weight_pct": 6.0,           # 6% account each long
-    "short_weight_pct":4.0,           # 4% account each short
-    "rebalance_hour_utc":0,           # rebalance at 00:00 UTC
-    "rebalance_min_change_pct":10.0,  # only rebalance if position would change >10%
-    "correlation_max": 0.85,          # exclude if corr > 0.85 with another held asset
-    "weekly_halt_drawdown_pct":5.0,   # halt for 72h if portfolio down 5% in a week
-    "halt_hours":      72,
-    "max_account_pct": 0.20,
-    "enabled":         True,
-}
+    elif bot_id == "bot6_funding":
+        rate      = m.get("entry_funding_rate", 0)
+        ann_rate  = rate * 3 * 365 * 100
+        payer     = "longs paying shorts" if direction == "SHORT" else "shorts paying longs"
+        return (
+            f"8-hour funding rate: {rate*100:.4f}% ({payer}). "
+            f"Annualised yield: ~{ann_rate:.1f}%. "
+            f"Spot-perp basis checked and within 0.20% threshold. "
+            f"Entering {direction.lower()} perp to collect funding payments."
+        )
 
-# ============================================================
-# SYSTEM SETTINGS
-# ============================================================
-SYSTEM = {
-    "heartbeat_interval_seconds":  30,
-    "watchdog_timeout_seconds":    120,    # 4× heartbeat interval — plenty of margin
-    "api_retry_attempts":          9,
-    "api_backoff_seconds":         [1, 2, 4, 8, 16, 32, 60, 120, 300],
-    "ws_reconnect_delay_seconds":  5,
-    "ws_ping_interval_seconds":    20,
-    "ws_ping_timeout_seconds":     10,
-    "position_reconcile_on_start": True,
-    "state_save_interval_seconds": 10,
-    "log_level":                   "INFO",
-    "log_file":                    "blofin_bot.log",
-    "health_check_port":           8080,   # HTTP health endpoint
-}
+    elif bot_id == "bot7_momentum":
+        target_pct = m.get("target_pct", 0)
+        strat      = m.get("strategy", "")
+        tier       = "top-3 momentum" if "long" in strat else "bottom-2 momentum"
+        return (
+            f"Daily rebalance: {inst_id} ranked in {tier} tier. "
+            f"Momentum score = (Close − Close[20]) / ATR(20). "
+            f"Correlation with other held assets < 0.85 — included. "
+            f"Target weight: {target_pct:.0f}% of account."
+        )
 
-# ============================================================
-# LOGGING FORMAT
-# ============================================================
-LOG_FORMAT = "%(asctime)s | %(name)-20s | %(levelname)-8s | %(message)s"
-LOG_DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
+    else:
+        return f"Signal generated by {bot_id} for {direction} on {inst_id} at {entry_price:.4f}."
 
-# ============================================================
-# MACRO EVENT SCHEDULE (UTC) — extend this list
-# These windows trigger the news blackout in the risk engine.
-# Format: "YYYY-MM-DD HH:MM"
-# In production replace with a live economic calendar API.
-# ============================================================
-KNOWN_MACRO_EVENTS: list[str] = [
-    # Add scheduled events here — populated at runtime from calendar API
-]
+
+def _build_forward(bot_id: str, direction: str, entry_price: float,
+                    sl_price: float, tp_price: Optional[float],
+                    size_usdt: float, kelly_frac: float,
+                    meta: Dict) -> str:
+    risk_pct  = abs(entry_price - sl_price) / entry_price * 100
+    parts = []
+
+    # TP
+    if tp_price:
+        rr   = abs(tp_price - entry_price) / abs(entry_price - sl_price) if sl_price != entry_price else 0
+        tp_d = "above" if direction == "LONG" else "below"
+        parts.append(
+            f"Take-profit: {tp_price:.4f} ({tp_d} entry by "
+            f"{abs(tp_price-entry_price)/entry_price*100:.2f}%) — R:R ≈ {rr:.1f}:1."
+        )
+
+    # SL
+    sl_d = "below" if direction == "LONG" else "above"
+    parts.append(f"Stop-loss: {sl_price:.4f} ({sl_d} entry, {risk_pct:.2f}% risk).")
+
+    # Bot-specific rules
+    if bot_id == "bot1_scalper":
+        parts.append("Time exit: auto-close after 8 minutes if TP/SL not hit. Cooldown: 3 min before next trade on this asset.")
+
+    elif bot_id == "bot2_trend":
+        parts.append("Partial exit: 50% of position will close at +4% — locking profit. Remaining half rides with trailing stop (2× ATR). Stop moves up as price moves in favour.")
+        kelly_adj = meta.get("kelly_adj", 1.0)
+        if kelly_adj < 1.0:
+            parts.append(f"Note: ADX was 25–40, so Kelly reduced to 60%. Full Kelly kicks in above ADX 40.")
+
+    elif bot_id == "bot3_meanrev":
+        sma = meta.get("sma", 0)
+        parts.append(f"Target: 50% reversion to 20-SMA ({float(sma):.4f}). Position closes when price reaches the halfway point between entry and the SMA. No trailing stop — clean exit at mean.")
+
+    elif bot_id == "bot5_breakout":
+        box_h = meta.get("box_height", 0)
+        tp_level = entry_price + box_h * 1.5 if direction == "LONG" else entry_price - box_h * 1.5
+        is_retest = meta.get("is_retest_add", False)
+        parts.append(f"TP = 1.5× box height ({float(box_h):.4f}) from breakout = {tp_level:.4f}.")
+        parts.append(f"SL = back inside the box — price invalidates the breakout if it closes back inside.")
+        if is_retest:
+            parts.append("This is the retest add-on (50% extra). Combined with the initial breakout entry for full position.")
+
+    elif bot_id == "bot6_funding":
+        parts.append(f"Minimum hold: 3 funding payments (24 hours). ")
+        parts.append(f"Exit conditions: rate falls below 0.01% OR rate declines for 2 consecutive 8h periods.")
+        parts.append(f"Emergency exit: if unrealized loss exceeds 2× collected funding at any time.")
+
+    elif bot_id == "bot7_momentum":
+        parts.append("Next rebalance: daily at 00:00 UTC. Position held until asset falls out of momentum tier OR portfolio composition changes > 10%.")
+        parts.append("Weekly guard: if portfolio drops 5% in 7 days, bot halts for 72 hours.")
+
+    parts.append(f"Position size: ${size_usdt:.0f} USDT ({kelly_frac*100:.1f}% half-Kelly).")
+
+    return " ".join(parts)
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _format_duration(seconds: int) -> str:
+    if seconds < 60:
+        return f"{seconds}s"
+    elif seconds < 3600:
+        return f"{seconds // 60}m {seconds % 60}s"
+    elif seconds < 86400:
+        h = seconds // 3600
+        m = (seconds % 3600) // 60
+        return f"{h}h {m}m"
+    else:
+        d = seconds // 86400
+        h = (seconds % 86400) // 3600
+        return f"{d}d {h}h"

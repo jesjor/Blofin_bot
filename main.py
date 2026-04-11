@@ -1,259 +1,115 @@
 """
-main.py — Master orchestrator for the BloFin 7-Bot Trading System.
-
-Startup sequence:
-  1. Logging
-  2. Database (init schema)
-  3. Alert manager (Telegram)
-  4. BloFin REST client (verify API creds)
-  5. Risk engine (load today's drawdown state)
-  6. Recovery manager (reconcile positions)
-  7. WebSocket (market data feeds)
-  8. Health monitor (HTTP /health endpoint)
-  9. Bots (in priority order: 6 → 2 → 5 → 3 → 1 → 4 → 7)
- 10. Watchdog + API health monitor + daily reset (background tasks)
-
-The system runs until SIGTERM/SIGINT, then gracefully shuts down.
+health_monitor.py — HTTP health check endpoint and system metrics.
+Runs an aiohttp server on port 8080.
+Railway, Docker, and uptime monitors hit /health to verify system is alive.
 """
 
 import asyncio
+import json
 import logging
-import os
-import sys
+import time
 from datetime import datetime, timezone
 
-# ── Bootstrap ─────────────────────────────────────────────────────────────────
+import aiohttp
+from aiohttp import web
 
-from alert_manager import setup_logging, get_alert_manager
-setup_logging()
+import psutil
 
-log = logging.getLogger("main")
+from config import SYSTEM
+from database import get_all_states, get_open_positions, get_state
+from blofin_client import get_client
 
-from config import (
-    TRADING_MODE, BLOFIN_API_KEY, DATABASE_URL,
-    BOT1, BOT2, BOT3, BOT4, BOT5, BOT6, BOT7,
-    PRIMARY_ASSETS, SYSTEM,
-)
+log = logging.getLogger("health")
+
+_start_time = time.time()
 
 
-async def main() -> None:
-    log.info("=" * 60)
-    log.info("BloFin 7-Bot Trading System — Starting")
-    log.info("Mode: %s", TRADING_MODE.upper())
-    log.info("=" * 60)
-
-    # ── 1. Validate environment ───────────────────────────────────────────────
-    if not DATABASE_URL:
-        log.critical("DATABASE_URL not set. Exiting.")
-        sys.exit(1)
-    if not BLOFIN_API_KEY:
-        log.warning("BLOFIN_API_KEY not set — running in data-only mode")
-
-    # ── 2. Database ───────────────────────────────────────────────────────────
-    from database import init_db, upsert_daily_pnl, set_state
-    await init_db()
-    log.info("Database ready")
-
-    # Record today's starting balance
-    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-
-    # ── 3. Alert manager ──────────────────────────────────────────────────────
-    alert = get_alert_manager()
-    await alert.start()
-
-    # ── 4. BloFin REST client — verify connectivity ───────────────────────────
-    from blofin_client import get_client
+async def health_handler(request: web.Request) -> web.Response:
+    """
+    GET /health — Returns 200 if system is operational, 503 if halted.
+    Used by Railway/Docker health checks and external monitors.
+    """
     try:
-        client  = await get_client()
-        balance = await client.get_usdt_balance()
-        await upsert_daily_pnl(today_str, balance)
-        await set_state("daily_starting_balance", str(balance))
-        log.info("Exchange connected | Balance: %.2f USDT", balance)
-        await alert.send(
-            f"🟢 <b>System Starting</b>\n"
-            f"Mode: {TRADING_MODE.upper()}\n"
-            f"Balance: {balance:.2f} USDT\n"
-            f"Time: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
+        states       = await get_all_states()
+        is_halted    = states.get("system_halted", "0") == "1"
+        halt_reason  = states.get("halt_reason", "")
+        open_pos     = await get_open_positions()
+        uptime_s     = int(time.time() - _start_time)
+
+        payload = {
+            "status":       "halted" if is_halted else "running",
+            "mode":         "PAPER" if not __import__("config").IS_LIVE else "LIVE",
+            "uptime_s":     uptime_s,
+            "open_positions": len(open_pos),
+            "halt_reason":  halt_reason if is_halted else None,
+            "timestamp":    datetime.now(timezone.utc).isoformat(),
+            "system": {
+                "cpu_pct":  psutil.cpu_percent(),
+                "mem_pct":  psutil.virtual_memory().percent,
+            },
+        }
+
+        status = 503 if is_halted else 200
+        return web.Response(
+            status=status,
+            content_type="application/json",
+            text=json.dumps(payload, indent=2),
         )
     except Exception as e:
-        log.error("Failed to connect to BloFin: %s", e)
-        await alert.send(f"⚠️ BloFin connection error on startup: {e}")
-        # Don't exit — we'll keep retrying via the API health monitor
+        log.error("Health check error: %s", e)
+        return web.Response(status=500, text=str(e))
 
-    # ── 5. Risk engine ────────────────────────────────────────────────────────
-    from risk_engine import get_risk_engine
-    risk = get_risk_engine()
-    log.info("Risk engine ready")
 
-    # ── 6. Recovery manager ───────────────────────────────────────────────────
-    from recovery_manager import get_recovery_manager
-    recovery = get_recovery_manager()
+async def metrics_handler(request: web.Request) -> web.Response:
+    """GET /metrics — Extended metrics for monitoring dashboards."""
+    try:
+        states    = await get_all_states()
+        open_pos  = await get_open_positions()
+        client    = await get_client()
+        balance   = await client.get_usdt_balance()
 
-    if SYSTEM["position_reconcile_on_start"]:
-        await recovery.reconcile_on_startup()
+        # Per-bot status from states
+        bot_statuses = {k: v for k, v in states.items() if k.startswith("bot_")}
 
-    # ── 7. WebSocket ──────────────────────────────────────────────────────────
-    from blofin_websocket import get_ws
-    ws = get_ws()
-    await ws.subscribe_tickers(PRIMARY_ASSETS)
-    await ws.subscribe_orders()
-    await ws.subscribe_funding(PRIMARY_ASSETS)
-    await ws.start()
-    log.info("WebSocket feeds started")
-
-    # ── 8. Dashboard + health endpoint ───────────────────────────────────────
-    from dashboard import start_dashboard
-    await start_dashboard()
-
-    # ── 8.5 Set leverage on all trading pairs ────────────────────────────────
-    # BloFin requires explicit leverage setting. Default = 5x cross margin.
-    # Conservative for demo — adjust in config once validated.
-    LEVERAGE = 5
-    log.info("Setting leverage %dx on all assets...", LEVERAGE)
-    for asset in PRIMARY_ASSETS:
-        try:
-            await client.set_leverage(asset, LEVERAGE, "cross")
-        except Exception as e:
-            log.warning("Could not set leverage for %s: %s", asset, e)
-
-    # ── 9. Instantiate bots ───────────────────────────────────────────────────
-    from bots import (
-        FundingArbBot, TrendFollowerBot, BreakoutBot,
-        MeanReversionBot, ScalperBot, MarketMakerBot, MultiMomentumBot,
-    )
-
-    bots = []
-    # Add only enabled bots (check config flag)
-    if BOT6.get("enabled", True):
-        bots.append(FundingArbBot())
-    if BOT2.get("enabled", True):
-        bots.append(TrendFollowerBot())
-    if BOT5.get("enabled", True):
-        bots.append(BreakoutBot())
-    if BOT3.get("enabled", True):
-        bots.append(MeanReversionBot())
-    if BOT1.get("enabled", True):
-        bots.append(ScalperBot())
-    if BOT4.get("enabled", True):
-        bots.append(MarketMakerBot())
-    if BOT7.get("enabled", True):
-        bots.append(MultiMomentumBot())
-
-    log.info("Bots loaded: %s", [b.bot_id for b in bots])
-
-    # ── 10. Register watchdog restart callbacks ───────────────────────────────
-    bot_tasks: dict[str, asyncio.Task] = {}
-
-    async def start_bot(bot) -> asyncio.Task:
-        task = asyncio.create_task(bot.start(), name=bot.bot_id)
-        bot_tasks[bot.bot_id] = task
-        log.info("Bot started: %s", bot.bot_id)
-        return task
-
-    async def restart_bot_callback(bot_id: str):
-        """Called by watchdog when a bot goes stale."""
-        bot = next((b for b in bots if b.bot_id == bot_id), None)
-        if not bot:
-            log.error("Restart callback: bot %s not found", bot_id)
-            return
-        # Cancel existing task if running
-        old_task = bot_tasks.get(bot_id)
-        if old_task and not old_task.done():
-            old_task.cancel()
-            try:
-                await old_task
-            except asyncio.CancelledError:
-                pass
-        # Restart
-        bot._running = True
-        bot._paused  = False
-        bot._error_count = 0
-        await start_bot(bot)
-
-    for bot in bots:
-        recovery.register_bot_restart(
-            bot.bot_id,
-            lambda b=bot: restart_bot_callback(b.bot_id),
+        payload = {
+            "balance_usdt":    round(balance, 2),
+            "open_positions":  len(open_pos),
+            "system_halted":   states.get("system_halted", "0") == "1",
+            "uptime_s":        int(time.time() - _start_time),
+            "bot_states":      bot_statuses,
+            "positions":       [
+                {
+                    "inst_id":    p["inst_id"],
+                    "bot_id":     p["bot_id"],
+                    "side":       p["side"],
+                    "entry":      float(p["entry_price"]),
+                    "pnl":        float(p.get("unrealized_pnl") or 0),
+                }
+                for p in open_pos
+            ],
+            "system_resources": {
+                "cpu_pct":  psutil.cpu_percent(),
+                "mem_pct":  psutil.virtual_memory().percent,
+                "disk_pct": psutil.disk_usage("/").percent,
+            },
+        }
+        return web.Response(
+            content_type="application/json",
+            text=json.dumps(payload, indent=2),
         )
-
-    # Register graceful shutdown
-    for bot in bots:
-        recovery.register_shutdown(bot.stop)
-    recovery.register_shutdown(ws.stop)
-    recovery.register_shutdown(alert.stop)
-
-    # ── 11. Start everything ──────────────────────────────────────────────────
-    loop = asyncio.get_event_loop()
-    recovery.setup_signal_handlers(loop)
-
-    # Start bots
-    for bot in bots:
-        await start_bot(bot)
-        await asyncio.sleep(2)   # stagger startup
-
-    # Background tasks
-    background_tasks = [
-        asyncio.create_task(recovery.run_watchdog(),          name="watchdog"),
-        asyncio.create_task(recovery.monitor_api_health(),    name="api_health"),
-        asyncio.create_task(recovery.run_daily_reset(),       name="daily_reset"),
-        asyncio.create_task(_daily_summary_loop(bots),        name="daily_summary"),
-    ]
-
-    log.info("=" * 60)
-    log.info("All systems operational. %d bots running.", len(bots))
-    log.info("=" * 60)
-
-    # ── 12. Run forever ───────────────────────────────────────────────────────
-    try:
-        all_tasks = list(bot_tasks.values()) + background_tasks
-        await asyncio.gather(*all_tasks, return_exceptions=True)
-    except asyncio.CancelledError:
-        log.info("Main gather cancelled — shutting down")
-    finally:
-        log.info("System shutdown complete")
-
-
-# ── Daily summary ─────────────────────────────────────────────────────────────
-
-async def _daily_summary_loop(bots) -> None:
-    """Sends a daily P&L summary at 23:55 UTC."""
-    while True:
-        now = datetime.now(timezone.utc)
-        # Next 23:55 UTC
-        target = now.replace(hour=23, minute=55, second=0, microsecond=0)
-        if now >= target:
-            import asyncio
-            await asyncio.sleep(86400 - (now - target).seconds)
-        else:
-            await asyncio.sleep((target - now).seconds)
-
-        try:
-            from blofin_client import get_client
-            from database import get_today_pnl, get_open_positions
-            client    = await get_client()
-            balance   = await client.get_usdt_balance()
-            pnl_row   = await get_today_pnl()
-            open_pos  = await get_open_positions()
-            daily_pnl = float(pnl_row.get("realized_pnl", 0)) if pnl_row else 0
-
-            alert = get_alert_manager()
-            await alert.send_daily_summary(
-                balance       = balance,
-                daily_pnl     = daily_pnl,
-                open_positions= len(open_pos),
-                trades_today  = 0,   # TODO: query trades table
-            )
-        except Exception as e:
-            log.error("Daily summary error: %s", e)
-
-
-# ── Entry point ───────────────────────────────────────────────────────────────
-
-if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        log.info("Interrupted by user")
     except Exception as e:
-        log.critical("Fatal error: %s", e, exc_info=True)
-        sys.exit(1)
+        return web.Response(status=500, text=str(e))
+
+
+async def start_health_server() -> None:
+    """Start the health check HTTP server. Non-blocking."""
+    app = web.Application()
+    app.router.add_get("/health",  health_handler)
+    app.router.add_get("/metrics", metrics_handler)
+    app.router.add_get("/",        health_handler)   # root alias
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", SYSTEM["health_check_port"])
+    await site.start()
+    log.info("Health server running on port %d", SYSTEM["health_check_port"])

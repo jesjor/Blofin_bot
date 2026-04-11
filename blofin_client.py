@@ -1,439 +1,172 @@
 """
-blofin_client.py — Authenticated REST API client for BloFin.
-Every request is signed per BloFin spec. Retry logic is built in.
-Paper mode stubs order placement but reads live market data.
+alert_manager.py — Telegram alerts and structured logging.
+Every significant event (trade, halt, error, daily summary) is sent here.
+Designed to be non-blocking — alert failures never crash a bot.
 """
 
 import asyncio
-import hashlib
-import hmac
-import base64
 import logging
-import time
-import uuid
-import json
-from typing import Optional, Dict, Any, List
+import logging.handlers
 from datetime import datetime, timezone
+from typing import Optional
 
 import aiohttp
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
-from config import (
-    BLOFIN_API_KEY, BLOFIN_API_SECRET, BLOFIN_API_PASSPHRASE,
-    BLOFIN_REST_URL, IS_PAPER, SYSTEM,
-)
+from config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, SYSTEM, LOG_FORMAT, LOG_DATE_FORMAT
 
-log = logging.getLogger("blofin_client")
+log = logging.getLogger("alerts")
 
 
-# ── Auth ──────────────────────────────────────────────────────────────────────
+def setup_logging() -> None:
+    """Configure root logger with file rotation + console output."""
+    root = logging.getLogger()
+    root.setLevel(getattr(logging, SYSTEM["log_level"], logging.INFO))
 
-import uuid as _uuid
+    fmt = logging.Formatter(LOG_FORMAT, LOG_DATE_FORMAT)
 
-def _sign(secret: str, path: str, method: str, timestamp: str,
-          nonce: str, body: str = "") -> str:
+    # Console
+    ch = logging.StreamHandler()
+    ch.setFormatter(fmt)
+    root.addHandler(ch)
+
+    # Rotating file (10 MB × 5 files)
+    fh = logging.handlers.RotatingFileHandler(
+        SYSTEM["log_file"], maxBytes=10 * 1024 * 1024, backupCount=5
+    )
+    fh.setFormatter(fmt)
+    root.addHandler(fh)
+
+
+class AlertManager:
     """
-    BloFin signature spec:
-      prehash = path + method + timestamp + nonce + body
-      hex_sig  = HMAC-SHA256(secret, prehash).hexdigest()
-      sign     = base64(hex_sig.encode())
-    """
-    prehash    = f"{path}{method}{timestamp}{nonce}{body}"
-    hex_sig    = hmac.new(secret.encode(), prehash.encode(), hashlib.sha256).hexdigest()
-    return base64.b64encode(hex_sig.encode()).decode()
-
-
-def _auth_headers(method: str, path: str, body: str = "") -> dict:
-    ts    = str(int(time.time() * 1000))
-    nonce = str(_uuid.uuid4())
-    return {
-        "ACCESS-KEY":        BLOFIN_API_KEY,
-        "ACCESS-SIGN":       _sign(BLOFIN_API_SECRET, path, method, ts, nonce, body),
-        "ACCESS-TIMESTAMP":  ts,
-        "ACCESS-NONCE":      nonce,
-        "ACCESS-PASSPHRASE": BLOFIN_API_PASSPHRASE,
-        "Content-Type":      "application/json",
-    }
-
-
-# ── Client ────────────────────────────────────────────────────────────────────
-
-class BloFinClient:
-    """
-    Async REST client. Use as async context manager or call init()/close().
-    All public methods raise BloFinAPIError on unrecoverable errors.
+    Send Telegram messages and structured trade alerts.
+    Messages are queued and sent asynchronously. If Telegram is down,
+    messages are logged locally — the trading system continues.
     """
 
-    class BloFinAPIError(Exception):
-        def __init__(self, code: int, msg: str, detail: dict = None):
-            self.code = code
-            self.msg  = msg
-            self.detail = detail or {}
-            super().__init__(f"[{code}] {msg}")
+    TELEGRAM_API = "https://api.telegram.org"
 
     def __init__(self):
+        self._queue: asyncio.Queue = asyncio.Queue(maxsize=500)
         self._session: Optional[aiohttp.ClientSession] = None
-        self._connector: Optional[aiohttp.TCPConnector] = None
+        self._running = False
 
-    async def init(self) -> None:
-        self._connector = aiohttp.TCPConnector(limit=20, ttl_dns_cache=300)
-        timeout = aiohttp.ClientTimeout(total=10, connect=5)
+    async def start(self) -> None:
         self._session = aiohttp.ClientSession(
-            connector=self._connector,
-            timeout=timeout,
-            base_url=BLOFIN_REST_URL,
+            timeout=aiohttp.ClientTimeout(total=10),
+            base_url=self.TELEGRAM_API,
         )
-        log.info("BloFin REST client ready (mode=%s)", "PAPER" if IS_PAPER else "LIVE")
+        self._running = True
+        asyncio.create_task(self._drain_queue())
+        log.info("AlertManager started")
 
-    async def close(self) -> None:
+    async def stop(self) -> None:
+        self._running = False
         if self._session:
             await self._session.close()
-        if self._connector:
-            await self._connector.close()
-        log.info("BloFin REST client closed")
 
-    async def __aenter__(self):
-        await self.init()
-        return self
+    # ── Public API ────────────────────────────────────────────────────────────
 
-    async def __aexit__(self, *_):
-        await self.close()
-
-    # ── Core request ─────────────────────────────────────────────────────────
-
-    @retry(
-        stop=stop_after_attempt(SYSTEM["api_retry_attempts"]),
-        wait=wait_exponential(multiplier=1, min=1, max=300),
-        retry=retry_if_exception_type((aiohttp.ClientError, asyncio.TimeoutError)),
-        reraise=True,
-    )
-    async def _request(self, method: str, path: str, params: dict = None,
-                        body: dict = None, signed: bool = False) -> dict:
+    async def send(self, message: str, parse_mode: str = "HTML") -> None:
+        """Queue a message for Telegram delivery. Never blocks."""
         try:
-            # Build full path including query string — BloFin signs the full path
-            if params:
-                query_string = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
-                full_path = f"{path}?{query_string}"
-            else:
-                full_path = path
+            self._queue.put_nowait({"text": message, "parse_mode": parse_mode})
+        except asyncio.QueueFull:
+            log.warning("Alert queue full — dropping message: %s", message[:80])
+        log.info("ALERT: %s", message[:200])
 
-            body_str = json.dumps(body) if body else ""
-            headers  = _auth_headers(method, full_path, body_str) if signed else {"Content-Type": "application/json"}
+    async def send_trade_opened(self, bot_id: str, inst_id: str, direction: str,
+                                  entry_price: float, size: float,
+                                  tp: float = None, sl: float = None) -> None:
+        mode = "📝 PAPER" if not __import__("config").IS_LIVE else "🟢 LIVE"
+        msg = (
+            f"{mode} TRADE OPENED\n"
+            f"<b>Bot:</b> {bot_id}\n"
+            f"<b>Asset:</b> {inst_id}\n"
+            f"<b>Direction:</b> {direction}\n"
+            f"<b>Entry:</b> {entry_price:.4f}\n"
+            f"<b>Size:</b> {size:.4f}\n"
+        )
+        if tp:
+            msg += f"<b>TP:</b> {tp:.4f}\n"
+        if sl:
+            msg += f"<b>SL:</b> {sl:.4f}\n"
+        await self.send(msg)
 
-            async with self._session.request(
-                method, path,
-                params=params,
-                data=body_str if body_str else None,
-                headers=headers,
+    async def send_trade_closed(self, bot_id: str, inst_id: str,
+                                  pnl: float, reason: str,
+                                  entry: float, exit_price: float) -> None:
+        emoji = "🟢" if pnl >= 0 else "🔴"
+        msg = (
+            f"{emoji} TRADE CLOSED\n"
+            f"<b>Bot:</b> {bot_id}\n"
+            f"<b>Asset:</b> {inst_id}\n"
+            f"<b>P&L:</b> {pnl:+.2f} USDT\n"
+            f"<b>Entry:</b> {entry:.4f} → <b>Exit:</b> {exit_price:.4f}\n"
+            f"<b>Reason:</b> {reason}\n"
+        )
+        await self.send(msg)
+
+    async def send_halt(self, reason: str) -> None:
+        await self.send(
+            f"🚨 <b>SYSTEM HALTED</b>\n<b>Reason:</b> {reason}\n"
+            f"<b>Time:</b> {datetime.now(timezone.utc).isoformat()}"
+        )
+
+    async def send_daily_summary(self, balance: float, daily_pnl: float,
+                                   open_positions: int, trades_today: int) -> None:
+        pct = (daily_pnl / (balance - daily_pnl) * 100) if balance else 0
+        emoji = "📈" if daily_pnl >= 0 else "📉"
+        await self.send(
+            f"{emoji} <b>DAILY SUMMARY</b>\n"
+            f"<b>Balance:</b> {balance:.2f} USDT\n"
+            f"<b>Daily P&L:</b> {daily_pnl:+.2f} USDT ({pct:+.2f}%)\n"
+            f"<b>Open positions:</b> {open_positions}\n"
+            f"<b>Trades today:</b> {trades_today}\n"
+        )
+
+    async def send_error(self, bot_id: str, error: str) -> None:
+        await self.send(f"⚠️ <b>ERROR</b> [{bot_id}]\n{error[:500]}")
+
+    # ── Queue drain loop ──────────────────────────────────────────────────────
+
+    async def _drain_queue(self) -> None:
+        while self._running or not self._queue.empty():
+            try:
+                item = await asyncio.wait_for(self._queue.get(), timeout=1.0)
+                await self._send_telegram(item["text"], item.get("parse_mode", "HTML"))
+                self._queue.task_done()
+            except asyncio.TimeoutError:
+                continue
+            except Exception as e:
+                log.warning("Alert drain error: %s", e)
+
+    async def _send_telegram(self, text: str, parse_mode: str = "HTML") -> None:
+        if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+            return   # Telegram not configured — logged above
+        try:
+            async with self._session.post(
+                f"/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                json={
+                    "chat_id":    TELEGRAM_CHAT_ID,
+                    "text":       text[:4096],
+                    "parse_mode": parse_mode,
+                },
             ) as resp:
-                raw = await resp.json(content_type=None)
-
-                if resp.status == 429:
-                    log.warning("Rate limited — sleeping 2 s")
-                    await asyncio.sleep(2)
-                    raise aiohttp.ClientError("rate_limit")
-
-                if resp.status >= 500:
-                    raise aiohttp.ClientError(f"server_error_{resp.status}")
-
-                # Some BloFin endpoints return a raw list with no code/data wrapper
-                if isinstance(raw, list):
-                    return raw
-
-                code = raw.get("code", "0")
-                if str(code) not in ("0", "200"):
-                    raise self.BloFinAPIError(int(code), raw.get("msg", "unknown"), raw)
-
-                return raw.get("data", raw)
-
-        except self.BloFinAPIError:
-            raise
+                if resp.status != 200:
+                    body = await resp.text()
+                    log.warning("Telegram error %d: %s", resp.status, body[:200])
         except Exception as e:
-            log.warning("Request error %s %s: %s", method, path, e)
-            raise
-
-    # ── Market data ──────────────────────────────────────────────────────────
-
-    async def get_ticker(self, inst_id: str) -> dict:
-        """Current best bid/ask, last price, 24h volume."""
-        data = await self._request("GET", "/api/v1/market/tickers",
-                                    params={"instId": inst_id})
-        return data[0] if isinstance(data, list) else data
-
-    async def get_tickers(self, inst_type: str = "SWAP") -> List[dict]:
-        """All tickers for given instrument type."""
-        return await self._request("GET", "/api/v1/market/tickers",
-                                    params={"instType": inst_type})
-
-    async def get_orderbook(self, inst_id: str, depth: int = 20) -> dict:
-        """Order book with bids and asks."""
-        data = await self._request("GET", "/api/v1/market/books",
-                                    params={"instId": inst_id, "sz": str(depth)})
-        # BloFin returns data as a list — take first element
-        return data[0] if isinstance(data, list) and data else (data or {})
-
-    async def get_candles(self, inst_id: str, bar: str = "1H",
-                           limit: int = 100) -> List[list]:
-        """
-        OHLCV candles. bar format: 1m, 5m, 15m, 1H, 4H, 1D
-        Returns list of [ts, open, high, low, close, vol, volCcy]
-        """
-        data = await self._request(
-            "GET", "/api/v1/market/candles",
-            params={"instId": inst_id, "bar": bar, "limit": str(limit)},
-        )
-        return data if isinstance(data, list) else []
-
-    async def get_funding_rate(self, inst_id: str) -> dict:
-        """Current and next funding rate for a perpetual."""
-        data = await self._request("GET", "/api/v1/public/funding-rate",
-                                    params={"instId": inst_id})
-        if isinstance(data, list):
-            return data[0] if data else {}
-        return data or {}
-
-    async def get_mark_price(self, inst_id: str) -> float:
-        data = await self._request("GET", "/api/v1/public/mark-price",
-                                    params={"instId": inst_id, "instType": "SWAP"})
-        rows = data if isinstance(data, list) else [data]
-        for row in rows:
-            if row.get("instId") == inst_id:
-                return float(row.get("markPx", 0))
-        return 0.0
-
-    # ── Account ───────────────────────────────────────────────────────────────
-
-    async def get_balance(self) -> dict:
-        """Futures account balance — used for all trading operations."""
-        # Trading section endpoint, not the spot account balance
-        data = await self._request("GET", "/api/v1/account/balance", signed=True)
-        if isinstance(data, list):
-            return data[0] if data else {}
-        return data or {}
-
-    async def get_futures_balance(self) -> dict:
-        """Alternative futures balance endpoint."""
-        data = await self._request("GET", "/api/v1/account/futures-balance", signed=True)
-        if isinstance(data, list):
-            return data[0] if data else {}
-        return data or {}
-
-    async def get_usdt_balance(self) -> float:
-        """Return available USDT equity for futures trading."""
-        # Try futures-specific balance first, fall back to general balance
-        try:
-            bal = await self.get_futures_balance()
-            if bal:
-                details = bal.get("details", [])
-                for item in details:
-                    if item.get("currency") == "USDT":
-                        return float(item.get("equity") or item.get("available") or 0)
-                if bal.get("totalEquity"):
-                    return float(bal["totalEquity"])
-        except Exception:
-            pass
-
-        # Fall back to general account balance
-        bal = await self.get_balance()
-        details = bal.get("details", [])
-        for item in details:
-            if item.get("currency") == "USDT":
-                val = float(item.get("equity") or item.get("available") or 0)
-                log.info("USDT balance: %.2f", val)
-                return val
-        if bal.get("totalEquity"):
-            return float(bal["totalEquity"])
-        log.warning("Could not parse balance: %s", str(bal)[:300])
-        return 0.0
-
-    async def get_positions(self, inst_id: str = None) -> List[dict]:
-        """All open positions on the account."""
-        params = {"instType": "SWAP"}
-        if inst_id:
-            params["instId"] = inst_id
-        data = await self._request("GET", "/api/v1/account/positions",
-                                    params=params, signed=True)
-        return data if isinstance(data, list) else []
-
-    async def set_leverage(self, inst_id: str, leverage: int,
-                            margin_mode: str = "cross") -> dict:
-        """Set leverage for an instrument before trading."""
-        body = {
-            "instId":     inst_id,
-            "leverage":   str(leverage),
-            "marginMode": margin_mode,
-        }
-        try:
-            result = await self._request("POST", "/api/v1/account/set-leverage",
-                                          body=body, signed=True)
-            log.info("Leverage set: %s %dx %s", inst_id, leverage, margin_mode)
-            return result
-        except Exception as e:
-            log.warning("set_leverage failed for %s: %s", inst_id, e)
-            return {}
-
-    async def get_instruments(self, inst_type: str = "SWAP") -> List[dict]:
-        """Get instrument specs including minimum order size (minSz) and contract value."""
-        data = await self._request("GET", "/api/v1/public/instruments",
-                                    params={"instType": inst_type})
-        return data if isinstance(data, list) else []
-
-    async def get_min_size(self, inst_id: str) -> float:
-        """Return minimum order size for an instrument. Defaults to 1."""
-        instruments = await self.get_instruments()
-        for inst in instruments:
-            if inst.get("instId") == inst_id:
-                return float(inst.get("minSize") or inst.get("minSz") or 1)
-        return 1.0
-
-    # ── Order management ──────────────────────────────────────────────────────
-
-    async def place_order(self, inst_id: str, side: str, order_type: str,
-                           size: float, price: float = None,
-                           tp_price: float = None, sl_price: float = None,
-                           reduce_only: bool = False,
-                           client_order_id: str = None) -> dict:
-        """
-        Place a single order.
-        side: "buy" | "sell"
-        order_type: "limit" | "market"
-        Returns full exchange response.
-        """
-        if client_order_id is None:
-            client_order_id = f"bb_{uuid.uuid4().hex[:16]}"
-
-        body: Dict[str, Any] = {
-            "instId":     inst_id,
-            "marginMode": "cross",
-            "side":       side.lower(),
-            "orderType":  order_type.lower(),
-            # Send as integer string if whole number, e.g. "1" not "1.0"
-            "size":       str(int(size)) if size == int(size) else str(round(size, 4)),
-            "clientOrderId": client_order_id,
-        }
-        if price and order_type.lower() == "limit":
-            body["price"] = str(round(price, 2))
-        if reduce_only:
-            body["reduceOnly"] = "true"
-        if tp_price:
-            body["tpTriggerPrice"] = str(round(tp_price, 2))   # BloFin field name
-            body["tpOrderPrice"]   = "-1"
-        if sl_price:
-            body["slTriggerPrice"] = str(round(sl_price, 2))   # BloFin field name
-            body["slOrderPrice"]   = "-1"
-
-        # Both PAPER and LIVE send real orders — PAPER uses demo exchange URL
-        result = await self._request("POST", "/api/v1/trade/order",
-                                      body=body, signed=True)
-        mode = "DEMO" if IS_PAPER else "LIVE"
-        log.info("[%s] ORDER PLACED: %s %s %s @ %s sz=%s -> %s",
-                  mode, inst_id, side, order_type, price, size,
-                  result.get("ordId") if isinstance(result, dict) else result)
-        return result
-
-    async def cancel_order(self, inst_id: str, order_id: str = None,
-                            client_order_id: str = None) -> dict:
-        body: Dict[str, Any] = {"instId": inst_id}
-        if order_id:
-            body["orderId"] = order_id
-        elif client_order_id:
-            body["clientOrderId"] = client_order_id
-        else:
-            raise ValueError("Must provide order_id or client_order_id")
-
-        return await self._request("POST", "/api/v1/trade/cancel-order",
-                                    body=body, signed=True)
-
-    async def cancel_all_orders(self, inst_id: str) -> None:
-        """Cancel every pending order for an instrument."""
-        pending = await self.get_pending_orders(inst_id)
-        if not pending:
-            return
-        tasks = [
-            self.cancel_order(inst_id, order_id=o.get("orderId") or o.get("ordId"))
-            for o in pending
-        ]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        for r in results:
-            if isinstance(r, Exception):
-                log.warning("Cancel error: %s", r)
-
-    async def get_pending_orders(self, inst_id: str = None) -> List[dict]:
-        params = {"instType": "SWAP"}
-        if inst_id:
-            params["instId"] = inst_id
-        data = await self._request("GET", "/api/v1/trade/orders-pending",
-                                    params=params, signed=True)
-        return data if isinstance(data, list) else []
-
-    async def get_order(self, inst_id: str, order_id: str = None,
-                         client_order_id: str = None) -> Optional[dict]:
-        params = {"instId": inst_id}
-        if order_id:
-            params["orderId"] = order_id
-        elif client_order_id:
-            params["clientOrderId"] = client_order_id
-        data = await self._request("GET", "/api/v1/trade/order",
-                                    params=params, signed=True)
-        return data if isinstance(data, dict) else (data[0] if data else None)
-
-    async def close_position(self, inst_id: str, side: str,
-                              size: float) -> dict:
-        """Close position at market. side = direction of existing position."""
-        close_side = "sell" if side.lower() in ("long", "buy") else "buy"
-        return await self.place_order(
-            inst_id=inst_id,
-            side=close_side,
-            order_type="market",
-            size=size,
-            reduce_only=True,
-        )
-
-    # ── Set TP/SL on existing position (algo order) ───────────────────────────
-
-    async def set_tp_sl(self, inst_id: str, pos_side: str,
-                         tp_price: float = None, sl_price: float = None) -> dict:
-        body: Dict[str, Any] = {
-            "instId":     inst_id,
-            "marginMode": "cross",
-            "posSide":    pos_side,
-        }
-        if tp_price:
-            body["tpTriggerPrice"] = str(round(tp_price, 2))
-            body["tpOrderPrice"]   = "-1"
-        if sl_price:
-            body["slTriggerPrice"] = str(round(sl_price, 2))
-            body["slOrderPrice"]   = "-1"
-
-        return await self._request("POST", "/api/v1/trade/order-algo",
-                                    body=body, signed=True)
-
-    # ── Convenience: mid price ────────────────────────────────────────────────
-
-    async def get_mid_price(self, inst_id: str) -> float:
-        ob = await self.get_orderbook(inst_id, depth=1)
-        bids = ob.get("bids", [[0]])
-        asks = ob.get("asks", [[0]])
-        best_bid = float(bids[0][0]) if bids else 0
-        best_ask = float(asks[0][0]) if asks else 0
-        return (best_bid + best_ask) / 2 if (best_bid and best_ask) else 0.0
-
-    async def get_best_bid_ask(self, inst_id: str) -> tuple:
-        ob = await self.get_orderbook(inst_id, depth=1)
-        bids = ob.get("bids", [[0]])
-        asks = ob.get("asks", [[0]])
-        return (float(bids[0][0]) if bids else 0,
-                float(asks[0][0]) if asks else 0)
+            log.warning("Telegram send failed: %s", e)
 
 
-# ── Singleton factory ─────────────────────────────────────────────────────────
+# ── Singleton ─────────────────────────────────────────────────────────────────
 
-_client: Optional[BloFinClient] = None
+_alert_manager: Optional[AlertManager] = None
 
 
-async def get_client() -> BloFinClient:
-    global _client
-    if _client is None:
-        _client = BloFinClient()
-        await _client.init()
-    return _client
+def get_alert_manager() -> AlertManager:
+    global _alert_manager
+    if _alert_manager is None:
+        _alert_manager = AlertManager()
+    return _alert_manager
