@@ -207,7 +207,6 @@ class BloFinClient:
     async def get_balance(self) -> dict:
         """Account balance."""
         data = await self._request("GET", "/api/v1/account/balance", signed=True)
-        log.info("RAW BALANCE RESPONSE: %s", str(data)[:500])   # temp debug
         if isinstance(data, list):
             return data[0] if data else {}
         return data or {}
@@ -215,25 +214,16 @@ class BloFinClient:
     async def get_usdt_balance(self) -> float:
         """Return available USDT equity from demo or live account."""
         bal = await self.get_balance()
-        log.info("PARSED BALANCE DICT: %s", str(bal)[:300])   # temp debug
-        # Structure 1: {"details": [{"ccy": "USDT", "eq": "49840"}]}
+        # BloFin uses: details[].currency, details[].equity, totalEquity
         details = bal.get("details", [])
         for item in details:
-            if item.get("ccy") == "USDT":
-                val = float(item.get("eq", 0) or item.get("availEq", 0) or 0)
-                log.info("USDT BALANCE from details: %.2f", val)
+            if item.get("currency") == "USDT":
+                val = float(item.get("equity") or item.get("available") or 0)
+                log.info("USDT balance: %.2f", val)
                 return val
-        # Structure 2: {"totalEq": "49840"}
-        if bal.get("totalEq"):
-            val = float(bal["totalEq"])
-            log.info("USDT BALANCE from totalEq: %.2f", val)
-            return val
-        # Structure 3: flat {"ccy": "USDT", "eq": "49840"}
-        if bal.get("ccy") == "USDT":
-            val = float(bal.get("eq", 0) or 0)
-            log.info("USDT BALANCE from flat: %.2f", val)
-            return val
-        log.warning("COULD NOT PARSE BALANCE. Full response: %s", str(bal)[:500])
+        if bal.get("totalEquity"):
+            return float(bal["totalEquity"])
+        log.warning("Could not parse balance: %s", str(bal)[:300])
         return 0.0
 
     async def get_positions(self, inst_id: str = None) -> List[dict]:
@@ -262,12 +252,12 @@ class BloFinClient:
             client_order_id = f"bb_{uuid.uuid4().hex[:16]}"
 
         body: Dict[str, Any] = {
-            "instId":  inst_id,
-            "tdMode":  "cross",
-            "side":    side.lower(),
-            "ordType": order_type.lower(),
-            "sz":      str(round(size, 4)),
-            "clOrdId": client_order_id,
+            "instId":     inst_id,
+            "marginMode": "cross",       # BloFin uses marginMode, not tdMode
+            "side":       side.lower(),
+            "ordType":    order_type.lower(),
+            "sz":         str(round(size, 4)),
+            "clOrdId":    client_order_id,
             "reduceOnly": str(reduce_only).lower(),
         }
         if price and order_type.lower() == "limit":
@@ -351,9 +341,9 @@ class BloFinClient:
     async def set_tp_sl(self, inst_id: str, pos_side: str,
                          tp_price: float = None, sl_price: float = None) -> dict:
         body: Dict[str, Any] = {
-            "instId":  inst_id,
-            "tdMode":  "cross",
-            "posSide": pos_side,   # "long" | "short"
+            "instId":     inst_id,
+            "marginMode": "cross",
+            "posSide":    pos_side,
         }
         if tp_price:
             body["tpTriggerPx"] = str(round(tp_price, 2))
