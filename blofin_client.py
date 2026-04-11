@@ -187,7 +187,7 @@ class BloFinClient:
     async def get_funding_rate(self, inst_id: str) -> dict:
         """Current and next funding rate for a perpetual."""
         data = await self._request("GET", "/api/v1/public/funding-rate",
-                                    params={"instId": inst_id}, signed=True)
+                                    params={"instId": inst_id})
         if isinstance(data, list):
             return data[0] if data else {}
         return data or {}
