@@ -82,19 +82,19 @@ class MarketMakerBot(BotBase):
             await self._cancel_all(inst_id)
             await asyncio.sleep(0.2)
 
-            # Place bid — BloFin perps use integer contract sizes (1 = minimum)
-            bid_coid = f"mm_bid_{inst_id}_{uuid.uuid4().hex[:8]}"
-            log.info("[%s] Placing bid: %s size=1 @ %.4f", self.bot_id, inst_id, our_bid)
+            inst_clean = inst_id.replace("-", "")   # BTCUSDT not BTC-USDT
+
+            # Place bid
+            bid_coid = f"mm_b_{inst_clean}_{uuid.uuid4().hex[:8]}"
             await client.place_order(inst_id, "buy", "limit",
-                                      size=1, price=our_bid,
+                                      size=CONTRACT_SIZE, price=our_bid,
                                       client_order_id=bid_coid)
             self._bid_orders[inst_id] = bid_coid
 
             # Place ask
-            ask_coid = f"mm_ask_{inst_id}_{uuid.uuid4().hex[:8]}"
-            log.info("[%s] Placing ask: %s size=1 @ %.4f", self.bot_id, inst_id, our_ask)
+            ask_coid = f"mm_a_{inst_clean}_{uuid.uuid4().hex[:8]}"
             await client.place_order(inst_id, "sell", "limit",
-                                      size=1, price=our_ask,
+                                      size=CONTRACT_SIZE, price=our_ask,
                                       client_order_id=ask_coid)
             self._ask_orders[inst_id] = ask_coid
 
@@ -113,7 +113,6 @@ class MarketMakerBot(BotBase):
                     await client.cancel_order(inst_id, client_order_id=coid)
                 except Exception:
                     pass
-
     async def _rebalance_inventory(self, inst_id: str, inventory: float,
                                     mid: float, client) -> None:
         """Reduce inventory that exceeds limits."""
