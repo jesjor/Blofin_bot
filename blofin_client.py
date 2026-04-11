@@ -291,6 +291,7 @@ class BloFinClient:
             body["slOrderPrice"]   = "-1"
 
         # Both PAPER and LIVE send real orders — PAPER uses demo exchange URL
+        log.info("PLACING ORDER body: %s", body)
         result = await self._request("POST", "/api/v1/trade/order",
                                       body=body, signed=True)
         mode = "DEMO" if IS_PAPER else "LIVE"
