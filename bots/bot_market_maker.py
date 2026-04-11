@@ -82,17 +82,19 @@ class MarketMakerBot(BotBase):
             await self._cancel_all(inst_id)
             await asyncio.sleep(0.2)
 
-            # Place bid
+            # Place bid — BloFin perps use integer contract sizes (1 = minimum)
             bid_coid = f"mm_bid_{inst_id}_{uuid.uuid4().hex[:8]}"
+            log.info("[%s] Placing bid: %s size=1 @ %.4f", self.bot_id, inst_id, our_bid)
             await client.place_order(inst_id, "buy", "limit",
-                                      size=0.001, price=our_bid,
+                                      size=1, price=our_bid,
                                       client_order_id=bid_coid)
             self._bid_orders[inst_id] = bid_coid
 
             # Place ask
             ask_coid = f"mm_ask_{inst_id}_{uuid.uuid4().hex[:8]}"
+            log.info("[%s] Placing ask: %s size=1 @ %.4f", self.bot_id, inst_id, our_ask)
             await client.place_order(inst_id, "sell", "limit",
-                                      size=0.001, price=our_ask,
+                                      size=1, price=our_ask,
                                       client_order_id=ask_coid)
             self._ask_orders[inst_id] = ask_coid
 
