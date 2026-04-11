@@ -75,6 +75,7 @@ INST_TYPE = "swap"   # perpetual futures
 BOT1 = {
     "id":              "bot1_scalper",
     "name":            "Momentum Scalper",
+    "leverage":        10,            # short holds + tight stops = safe to use higher leverage
     "assets":          ["BTC-USDT", "ETH-USDT", "SOL-USDT"],
     "timeframe_signal":"5m",
     "timeframe_entry": "1m",
@@ -103,6 +104,7 @@ BOT1 = {
 BOT2 = {
     "id":              "bot2_trend",
     "name":            "Trend Follower",
+    "leverage":        5,             # longer holds, trailing stop needs room
     "assets":          ["BTC-USDT", "ETH-USDT", "SOL-USDT"],
     "timeframe_signal":"4h",
     "timeframe_trend": "1d",
@@ -130,6 +132,7 @@ BOT2 = {
 BOT3 = {
     "id":              "bot3_meanrev",
     "name":            "Mean Reversion",
+    "leverage":        5,             # ranging market, controlled risk
     "assets":          ["BTC-USDT", "ETH-USDT"],
     "timeframe_signal":"1h",
     "rsi_period":       14,
@@ -153,6 +156,7 @@ BOT3 = {
 BOT4 = {
     "id":              "bot4_mm",
     "name":            "Market Maker",
+    "leverage":        3,             # inventory risk — keep low
     "assets":          ["BTC-USDT", "ETH-USDT"],
     "spread_target_pct":    0.06,     # quote ±0.06% from mid
     "quote_refresh_seconds":10,
@@ -172,6 +176,7 @@ BOT4 = {
 BOT5 = {
     "id":              "bot5_breakout",
     "name":            "Breakout Hunter",
+    "leverage":        10,            # well-defined SL (back in box) = safe for higher leverage
     "assets":          ["BTC-USDT", "ETH-USDT", "SOL-USDT"],
     "timeframe_signal":"1h",
     "timeframe_confirm":"4h",
@@ -194,6 +199,7 @@ BOT5 = {
 BOT6 = {
     "id":              "bot6_funding",
     "name":            "Funding Rate Arb",
+    "leverage":        5,             # capital efficiency — low directional risk
     "assets":          ["BTC-USDT", "ETH-USDT", "SOL-USDT"],
     "funding_interval_hours": 8,
     "funding_entry_threshold":0.05,   # enter if 8h rate > +0.05%
@@ -214,6 +220,7 @@ BOT7 = {
     "id":              "bot7_momentum",
     "name":            "Multi-Asset Momentum",
     "assets":          [],             # empty — universe built dynamically at runtime
+    "leverage":        5,             # portfolio level — moderate
     "universe_size":   10,            # top 10 assets by 30-day volume
     "momentum_period": 20,            # 20-day momentum score
     "atr_period":      20,
