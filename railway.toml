@@ -6,7 +6,4 @@ startCommand = "python main.py"
 restartPolicyType = "always"
 restartPolicyMaxRetries = 10
 healthcheckPath = "/health"
-healthcheckTimeout = 30
-
-[[services]]
-name = "blofin-bot"
+healthcheckTimeout = 120
