@@ -424,11 +424,16 @@ async def log_risk_event(event_type: str, reason: str, bot_id: str = None,
 
 # ── Daily P&L ─────────────────────────────────────────────────────────────────
 
-async def upsert_daily_pnl(date: str, starting_balance: float,
+async def upsert_daily_pnl(date, starting_balance: float,
                             realized_pnl: float = 0,
                             unrealized_pnl: float = 0,
                             drawdown_pct: float = 0) -> None:
     pool = await get_pool()
+    # asyncpg needs a datetime.date object, not a string
+    from datetime import date as date_type
+    if isinstance(date, str):
+        from datetime import datetime
+        date = datetime.strptime(date, "%Y-%m-%d").date()
     async with pool.acquire() as conn:
         await conn.execute(
             """

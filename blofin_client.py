@@ -109,10 +109,17 @@ class BloFinClient:
     )
     async def _request(self, method: str, path: str, params: dict = None,
                         body: dict = None, signed: bool = False) -> dict:
-        body_str = json.dumps(body) if body else ""
-        headers  = _auth_headers(method, path, body_str) if signed else {"Content-Type": "application/json"}
-
         try:
+            # Build full path including query string — BloFin signs the full path
+            if params:
+                query_string = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
+                full_path = f"{path}?{query_string}"
+            else:
+                full_path = path
+
+            body_str = json.dumps(body) if body else ""
+            headers  = _auth_headers(method, full_path, body_str) if signed else {"Content-Type": "application/json"}
+
             async with self._session.request(
                 method, path,
                 params=params,
