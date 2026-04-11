@@ -173,9 +173,9 @@ def get_alert_manager() -> AlertManager:
 
 # ── Singleton accessor ────────────────────────────────────────────────────────
 
-_client_instance: Optional[BloFinClient] = None
+_client_instance = None
 
-async def get_client() -> BloFinClient:
+async def get_client():
     global _client_instance
     if _client_instance is None:
         _client_instance = BloFinClient()
