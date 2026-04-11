@@ -13,9 +13,13 @@ load_dotenv()
 # ============================================================
 # API CREDENTIALS
 # ============================================================
-BLOFIN_API_KEY        = os.getenv("BLOFIN_API_KEY", "")
-BLOFIN_API_SECRET     = os.getenv("BLOFIN_API_SECRET", "")
-BLOFIN_API_PASSPHRASE = os.getenv("BLOFIN_API_PASSPHRASE", "")
+def _clean(val: str) -> str:
+    """Strip quotes and whitespace Railway sometimes wraps around env var values."""
+    return val.strip().strip('"').strip("'").strip()
+
+BLOFIN_API_KEY        = _clean(os.getenv("BLOFIN_API_KEY", ""))
+BLOFIN_API_SECRET     = _clean(os.getenv("BLOFIN_API_SECRET", ""))
+BLOFIN_API_PASSPHRASE = _clean(os.getenv("BLOFIN_API_PASSPHRASE", ""))
 
 BLOFIN_REST_URL = "https://openapi.blofin.com"
 BLOFIN_WS_PUBLIC  = "wss://openapi.blofin.com/ws/public"
@@ -24,12 +28,12 @@ BLOFIN_WS_PRIVATE = "wss://openapi.blofin.com/ws/private"
 # ============================================================
 # ENVIRONMENT
 # ============================================================
-TRADING_MODE = os.getenv("TRADING_MODE", "paper")   # "paper" | "live"
+TRADING_MODE = _clean(os.getenv("TRADING_MODE", "paper"))
 IS_LIVE      = TRADING_MODE == "live"
 IS_PAPER     = not IS_LIVE
 
-DATABASE_URL = os.getenv("DATABASE_URL", "")
-REDIS_URL    = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+DATABASE_URL = _clean(os.getenv("DATABASE_URL", ""))
+REDIS_URL    = _clean(os.getenv("REDIS_URL", "redis://localhost:6379/0"))
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
