@@ -28,20 +28,29 @@ log = logging.getLogger("blofin_client")
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
 
-def _sign(secret: str, timestamp: str, method: str, path: str, body: str = "") -> str:
-    message = timestamp + method.upper() + path + (body or "")
-    return base64.b64encode(
-        hmac.new(secret.encode("utf-8"), message.encode("utf-8"), hashlib.sha256).digest()
-    ).decode("utf-8")
+import uuid as _uuid
+
+def _sign(secret: str, path: str, method: str, timestamp: str,
+          nonce: str, body: str = "") -> str:
+    """
+    BloFin signature spec:
+      prehash = path + method + timestamp + nonce + body
+      hex_sig  = HMAC-SHA256(secret, prehash).hexdigest()
+      sign     = base64(hex_sig.encode())
+    """
+    prehash    = f"{path}{method}{timestamp}{nonce}{body}"
+    hex_sig    = hmac.new(secret.encode(), prehash.encode(), hashlib.sha256).hexdigest()
+    return base64.b64encode(hex_sig.encode()).decode()
 
 
 def _auth_headers(method: str, path: str, body: str = "") -> dict:
-    ts = str(int(time.time() * 1000))
+    ts    = str(int(time.time() * 1000))
+    nonce = str(_uuid.uuid4())
     return {
         "ACCESS-KEY":        BLOFIN_API_KEY,
-        "ACCESS-SIGN":       _sign(BLOFIN_API_SECRET, ts, method, path, body),
+        "ACCESS-SIGN":       _sign(BLOFIN_API_SECRET, path, method, ts, nonce, body),
         "ACCESS-TIMESTAMP":  ts,
-        "ACCESS-NONCE":      ts,          # BloFin requires this — same value as timestamp
+        "ACCESS-NONCE":      nonce,
         "ACCESS-PASSPHRASE": BLOFIN_API_PASSPHRASE,
         "Content-Type":      "application/json",
     }

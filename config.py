@@ -21,12 +21,8 @@ BLOFIN_API_KEY        = _clean(os.getenv("BLOFIN_API_KEY", ""))
 BLOFIN_API_SECRET     = _clean(os.getenv("BLOFIN_API_SECRET", ""))
 BLOFIN_API_PASSPHRASE = _clean(os.getenv("BLOFIN_API_PASSPHRASE", ""))
 
-BLOFIN_REST_URL = "https://openapi.blofin.com"
-BLOFIN_WS_PUBLIC  = "wss://openapi.blofin.com/ws/public"
-BLOFIN_WS_PRIVATE = "wss://openapi.blofin.com/ws/private"
-
 # ============================================================
-# ENVIRONMENT
+# ENVIRONMENT — must be defined before URLs
 # ============================================================
 TRADING_MODE = _clean(os.getenv("TRADING_MODE", "paper"))
 IS_LIVE      = TRADING_MODE == "live"
@@ -37,6 +33,13 @@ REDIS_URL    = _clean(os.getenv("REDIS_URL", "redis://localhost:6379/0"))
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
+
+# ============================================================
+# API URLS — demo vs live
+# ============================================================
+BLOFIN_REST_URL   = "https://demo-trading-openapi.blofin.com"            if IS_PAPER else "https://openapi.blofin.com"
+BLOFIN_WS_PUBLIC  = "wss://demo-trading-openapi.blofin.com/ws/public"   if IS_PAPER else "wss://openapi.blofin.com/ws/public"
+BLOFIN_WS_PRIVATE = "wss://demo-trading-openapi.blofin.com/ws/private"  if IS_PAPER else "wss://openapi.blofin.com/ws/private"
 
 # ============================================================
 # UNIVERSAL RISK ENGINE — NON-NEGOTIABLE
